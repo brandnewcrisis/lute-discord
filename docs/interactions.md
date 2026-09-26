@@ -3,9 +3,10 @@
 An *interaction* is Discord telling your bot that a user did something aimed
 at it: ran a slash command, used a context menu, typed into an autocomplete
 option, clicked a button, picked from a select menu, or submitted a modal.
-Every handler you register with `client:command`, `client:component`,
-`client:modal` or `client:autocomplete` receives one, as a
-`Discord.Interaction`.
+Every handler receives one, as a `Discord.Interaction`: the ones on command
+builders (`:handle`, `:onAutocomplete`) and the ones you register with
+`client:command`, `client:component`, `client:modal` or
+`client:autocomplete`.
 
 An interaction comes with a token, and you answer through that token rather
 than through your bot's normal credentials. That's why answering an
@@ -176,11 +177,69 @@ Both return `any`. An option's type is fixed by the command definition,
 which lives somewhere else (often in another file) and which Luau can't see
 from the handler. The honest static type would be `string | number |
 boolean`, and that would force a type check on every read of a value your
-handler already knows the type of. Annotate the local if you want the checker
-to hold you to it: `local count: number = ix:opt("count", 1)`.
+handler already knows the type of. For a typed value, use the
+[typed getters](#typed-getters) below.
 
-These read the innermost subcommand's options, so `/config roles add
-role:@Mod` gives you `role` directly.
+These, and every reader below, read the innermost subcommand's options, so
+`/config roles add role:@Mod` gives you `role` directly.
+
+### Typed getters
+
+`opt` takes your word for an option's type. The typed getters check it:
+
+| Method | Returns | Reads an option of type |
+| --- | --- | --- |
+| `ix:getString(name)` | `string?` | string |
+| `ix:getInteger(name)` | `number?` | integer |
+| `ix:getNumber(name)` | `number?` | number, or integer |
+| `ix:getBoolean(name)` | `boolean?` | boolean |
+| `ix:getMentionable(name)` | `Mentionable?` | mentionable, user or role (see [below](#mentionables)) |
+
+```luau
+local count = ix:getInteger("count") or 1 -- a number, as far as the checker knows
+local reason = ix:getString("reason") or "no reason given"
+```
+
+Each returns nil when the option wasn't supplied. `getBoolean` returns nil
+for a missing option, not `false`, so you can tell the two apart.
+
+Discord sends each option's type alongside its value, and each getter
+compares that with the type you asked for. When they disagree it throws,
+naming both: `option "count" is an integer, not a string`. That happens when
+someone edits the definition and not the handler, and without the check it
+shows up much later as a comparison that's always false. `getNumber` accepts
+an integer option, since every integer is a number.
+
+On an autocomplete interaction, the option being typed carries the raw text
+so far even when the option is numeric. `getInteger` and `getNumber` parse
+it, and return nil while it isn't a number yet (`""`, `"-"`).
+
+### Mentionables
+
+A mentionable option names a user or a role, and its value is just an ID.
+`ix:getMentionable(name)` looks the ID up in what Discord resolved and
+returns a record that says which it found:
+
+```text
+{ kind: "user", id: string, user: Discord.User, member: Discord.Member? }
+| { kind: "role", id: string, role: Discord.Role }
+```
+
+Checking `kind` narrows the rest, so `user` is non-optional in the user
+branch:
+
+```luau
+local target = ix:requireMentionable("who")
+if target.kind == "user" then
+	ix:reply(`Tipped {target.user.username}.`)
+else
+	ix:reply(`Tipped everyone in {target.role.name}.`)
+end
+```
+
+`member` is there when the user is in the server, with `member.user` filled
+in. It returns nil when the option is absent, or when Discord sent nothing
+resolved for the ID. A user or role option can be read this way too.
 
 ### `get*`: resolved objects
 
@@ -211,6 +270,11 @@ The `require*` family is where you tell it once:
 | Method | Returns | Throws when |
 | --- | --- | --- |
 | `ix:requireOpt(name)` | `any` | the option is missing |
+| `ix:requireString(name)` | `string` | missing, or not a string option |
+| `ix:requireInteger(name)` | `number` | missing, or not an integer option |
+| `ix:requireNumber(name)` | `number` | missing, or not a number or integer option |
+| `ix:requireBoolean(name)` | `boolean` | missing, or not a boolean option (`false` is a value, not a miss) |
+| `ix:requireMentionable(name)` | `Mentionable` | missing, or Discord sent no resolved user or role |
 | `ix:requireUser(name)` | `Discord.User` | missing, or Discord sent no resolved user |
 | `ix:requireMember(name)` | `Discord.Member` | missing, or the user isn't in this server |
 | `ix:requireRole(name)` | `Discord.Role` | missing, or no resolved role |
@@ -234,7 +298,7 @@ client:command("kick", function(ix: Discord.Interaction)
 		ix:replyEphemeral(`{user.username} isn't in this server.`)
 		return
 	end
-	local reason: string = ix:opt("reason", "no reason given")
+	local reason = ix:getString("reason") or "no reason given"
 	ix:defer(true)
 	client.api.guilds.kickMember(guildId, user.id, reason)
 	ix:reply(`Kicked {user.username}.`)
@@ -260,9 +324,26 @@ end)
 command out of DMs, and `requireGuildId` gives the handler a `string` instead
 of `string?`.
 
-`ix.client` exists, but it's typed as just `{ api: Api }` (the interaction
-module can't depend on the client module). To reach `client.cache` or other
-client methods, use the `client` variable your handler closes over.
+`ix.client` is the client that received the interaction, typed with the
+parts a handler reaches for: `api`, `cache`, and `user` (the bot's own user,
+nil until the bot is ready). A handler in its own file, with no `client`
+variable in scope, can still read the cache:
+
+```luau
+return Commands.slash("roles", "How many roles this server has")
+	:guildOnly()
+	:handle(function(ix)
+		local count = 0
+		for _ in ix.client.cache:getRoles(ix:requireGuildId()) do
+			count += 1
+		end
+		ix:reply(`This server has {count} roles.`)
+	end)
+```
+
+That's all `ix.client` is typed with, because the interaction module can't
+depend on the client module. For other client methods (`collect`, `send`,
+`waitFor`), use the `client` variable itself.
 
 ### Context menus, selects and autocomplete
 
@@ -271,6 +352,7 @@ client methods, use the `client` variable your handler closes over.
 | `ix:targetUser()` | user context menus | `Discord.User?`, the user right-clicked |
 | `ix:targetMessage()` | message context menus | `Discord.Message?`, the message right-clicked |
 | `ix:values()` | select menus | `{ string }`, the chosen values or IDs |
+| `ix:selectedUsers()`, `selectedMembers()`, `selectedRoles()`, `selectedChannels()` | user, role, mentionable and channel selects | the picked objects, already resolved. See [components.md](components.md#select-menus). |
 | `ix:focused()` | autocomplete | `(name?, valueSoFar)` for the option being typed |
 
 The modal readers (`modalValue`, `modalSelected` and the rest) are covered
@@ -313,8 +395,9 @@ Every handler runs on its own task inside `xpcall`. When one throws:
    into "The application did not respond".
 4. The shard and every other handler keep running.
 
-The user never sees the error text itself. Discord errors routinely quote
-IDs and tokens, and a traceback means nothing to a user anyway.
+By default the user never sees the error text itself. Discord errors
+routinely quote IDs and tokens, and a traceback means nothing to a user
+anyway.
 
 Autocomplete handlers are the exception to step 3. There's no message to
 send in response to a keystroke, so a failed autocomplete just shows no
@@ -330,6 +413,25 @@ local client = Discord.Client.new({
 	-- errorMessage = false, -- send nothing
 })
 ```
+
+While you develop, `showErrors = true` adds the error's first line to the
+notice, in a code block, so whoever is testing sees what broke without
+opening the log:
+
+```luau
+local client = Discord.Client.new({
+	token = env:require("DISCORD_TOKEN"),
+	intents = { "guilds" },
+	showErrors = true, -- development only
+})
+```
+
+It sends the first line only, never the traceback, and nothing for
+autocomplete. With `errorMessage = false` nothing is sent at all. Turn it
+off before the bot goes anywhere public: error messages quote internal
+details (file paths, IDs, query text) that users have no business reading.
+The scaffold's `main.luau` turns it on, with a comment saying so (see
+[getting-started.md](getting-started.md)).
 
 Throwing is for bugs. When the user did something wrong, like naming a tag
 that doesn't exist, reply with a proper message and `return`. To handle an

@@ -1602,7 +1602,8 @@ export type MemberRequest = {
 	Events that carry a whole object reuse its type -- `messageCreate` and
 	`messageUpdate` are a `Message`, `channelCreate` a `Channel`, `guildCreate`
 	a `Guild`. The ones below are the events whose payload is its own shape.
-	`docs/events.md` lists every event against its type.
+	`docs/events.md` lists every event against its type, and
+	`@discord/events` is the same table in code, which `client:on` is typed by.
 ]]
 
 --- `guildMemberAdd`, `guildMemberUpdate`: a member plus the guild it is in.
@@ -1817,5 +1818,53 @@ export type GuildIdEvent = { guild_id: Snowflake, [string]: any }
 --- `voiceServerUpdate`. Useless without a voice client, which Lute cannot
 --- host; typed so a bot that forwards it to one can.
 export type VoiceServerUpdate = { token: string, guild_id: Snowflake, endpoint: string?, [string]: any }
+
+--- `threadMemberUpdate`: the bot's own membership of a thread changed.
+export type ThreadMemberUpdate = ThreadMember & { guild_id: Snowflake }
+
+--- `integrationCreate`, `integrationUpdate`.
+export type IntegrationEvent = Integration & { guild_id: Snowflake }
+
+export type IntegrationDelete = {
+	id: Snowflake,
+	guild_id: Snowflake,
+	--- The bot or OAuth2 application of a removed app integration.
+	application_id: Snowflake?,
+	[string]: any,
+}
+
+export type GuildSoundboardSoundDelete = { sound_id: Snowflake, guild_id: Snowflake, [string]: any }
+
+--- `guildSoundboardSoundsUpdate`, and `soundboardSounds` (the reply to a
+--- soundboard request, op 31).
+export type GuildSoundboardSounds = { guild_id: Snowflake, soundboard_sounds: { SoundboardSound }, [string]: any }
+
+--- `voiceChannelEffectSend`: someone sent an emoji reaction or soundboard
+--- sound in a voice channel the bot can see.
+export type VoiceChannelEffectSend = {
+	channel_id: Snowflake,
+	guild_id: Snowflake,
+	user_id: Snowflake,
+	emoji: Emoji?,
+	animation_type: number?,
+	animation_id: number?,
+	sound_id: (Snowflake | number)?,
+	sound_volume: number?,
+	[string]: any,
+}
+
+export type VoiceChannelStatusUpdate = { id: Snowflake, guild_id: Snowflake, status: string?, [string]: any }
+
+export type VoiceChannelStartTimeUpdate = {
+	id: Snowflake,
+	guild_id: Snowflake,
+	--- ISO timestamp, or nil when the call ended.
+	voice_start_time: string?,
+	[string]: any,
+}
+
+--- `rateLimited`: a gateway request (op 8, a member fetch) was refused for
+--- going too fast. `retry_after` is in seconds.
+export type RateLimited = { opcode: number, retry_after: number, meta: { [string]: any }, [string]: any }
 
 return {}

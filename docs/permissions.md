@@ -36,13 +36,13 @@ wanted:toString()                          -- "6", for the wire
 
 | Function | Does |
 | --- | --- |
-| `Permissions.of(...names)` | Combines permission names into one field. An unknown name throws: a typo that silently meant "no permission" would let everyone through. |
+| `Permissions.of(...names)` | Combines permission names into one field. An unknown name throws, naming the likely intended one: a typo that silently meant "no permission" would let everyone through. |
 | `Permissions.parse(text?)` | Parses Discord's decimal string. `nil` or `""` gives an empty field. |
 | `Permissions.list(field)` | The names set in a field, sorted. |
 | `Permissions.has(field, nameOrField)` | True if every bit is set, **or if the field holds `administrator`**. |
-| `Permissions.forMember(guild, member, roles?)` | Guild-wide permissions. See below. |
-| `Permissions.forChannel(guild, member, channel, roles?)` | Effective permissions in one channel. |
-| `Permissions.outranks(guild, actor, target, roles?)` | Role hierarchy. |
+| `Permissions.forMember(guild, member, roles?, userId?)` | Guild-wide permissions. See below. |
+| `Permissions.forChannel(guild, member, channel, roles?, userId?)` | Effective permissions in one channel. |
+| `Permissions.outranks(guild, actor, target, roles?, actorId?, targetId?)` | Role hierarchy. |
 | `Permissions.isTimedOut(member)` | True while the member's timeout is in the future. |
 | `Permissions.Flags` | Every permission by name, as a single-bit `Bitfield`. |
 | `Permissions.NONE`, `Permissions.ALL` | The empty field, and every known permission. |
@@ -51,9 +51,13 @@ wanted:toString()                          -- "6", for the wire
 `client.cache:getRoles(guildId)` is exactly that. Without it, the functions
 build one from `guild.roles`.
 
-Use `Permissions.has` rather than the bitfield's own `has` for checks. The
-bitfield method doesn't know about `administrator`, and it reads a string
-argument as a decimal number, not a name: `field:has("banMembers")` throws.
+The trailing ids are for member objects that arrive without `user`. See
+[Members without `user`](#members-without-user).
+
+Use `Permissions.has` rather than the bitfield's own `has` for checks. Both
+take a permission name, but the bitfield method doesn't know about
+`administrator`: `field:has("banMembers")` is false for an administrator
+who doesn't also hold Ban Members, and Discord would let them ban.
 
 ## `Bitfield`
 
@@ -62,9 +66,10 @@ Values are immutable: every operation returns a new field.
 | Function | Does |
 | --- | --- |
 | `Bitfield.fromString(text)` | From a decimal string. The form Discord sends. |
+| `Bitfield.fromName(name)` | A permission name as a single-bit field: `Bitfield.fromName("banMembers")`. |
 | `Bitfield.fromBit(n)` | A single bit, 0 to 63. |
 | `Bitfield.fromNumber(n)` | From a number below 2^53. |
-| `Bitfield.of(...)` | Combines any mix of fields, decimal strings and numbers. |
+| `Bitfield.of(...)` | Combines any mix of fields, decimal strings, numbers and permission names. |
 | `Bitfield.empty` | No bits. |
 | `field:has(other)`, `field:hasAny(other)` | All bits of `other` set, or at least one. |
 | `field:union(other)`, `field:without(other)`, `field:intersect(other)` | Set operations. |
@@ -74,6 +79,22 @@ Values are immutable: every operation returns a new field.
 
 `==` compares two fields by value.
 
+Every method that takes `other`, and `Bitfield.of`, accepts a field, a
+number, a decimal string, or a permission name. A string of digits is always
+a mask, and anything else is a name, since no permission name is numeric.
+An unknown name throws with a suggestion (`unknown permission "banMemebrs";
+did you mean "banMembers"?`) rather than meaning "no bits". That matters
+here more than anywhere: the empty mask is contained in every field, so a
+misspelled name that quietly became empty would make `field:has(...)` true
+for everyone.
+
+```luau
+local held = Permissions.parse(role.permissions)
+if held:hasAny(Bitfield.of("kickMembers", "banMembers")) then
+	print("this role can remove people")
+end
+```
+
 ## Guild permissions: `forMember`
 
 A member's guild-wide permissions are the `@everyone` role's permissions
@@ -81,9 +102,29 @@ plus those of every role they hold. The `@everyone` role always has the same
 id as the guild. The server owner, and anyone whose roles include
 `administrator`, gets `Permissions.ALL`.
 
-The owner check reads `member.user.id`. Some member objects arrive without a
-`user` field (the resolved members in an interaction's options are one
-example), so set it before passing one in if the member could be the owner.
+The owner check needs the member's user id, which is normally
+`member.user.id`. See the next section for members that arrive without it.
+
+### Members without `user`
+
+A member object only names its user through `member.user`, and some arrive
+without it: the members Discord resolves in an interaction
+(`ix.data.resolved.members`, or a select's picks) put the user in a sibling
+map instead. Such a member can't be recognised as the server owner, or
+matched to its own channel overwrite, so the owner would be judged by roles
+alone.
+
+Pass the user id as the trailing argument when you have a member like that:
+
+```luau
+local perms = Permissions.forChannel(guild, member, channel, client.cache:getRoles(guild.id), "123456789012345678")
+```
+
+`forMember` and `forChannel` take `userId`, and `outranks` takes `actorId`
+and `targetId`. An id you pass wins over `member.user`. Without either, the
+first such call logs one warning that explains the gap. `ix:getMember` and
+`ix:selectedMembers` fill `member.user` in for you, so members from those
+need no id.
 
 ## Channel permissions: `forChannel`
 
@@ -131,8 +172,9 @@ refuses to let anyone, a bot included, kick, ban, time out, rename or edit
 the roles of a member whose highest role is at or above their own. The owner
 outranks everyone and can't be acted on at all.
 
-`Permissions.outranks(guild, actor, target, roles?)` returns true when
-`actor`'s highest role is strictly above `target`'s, or `actor` is the owner.
+`Permissions.outranks(guild, actor, target, roles?, actorId?, targetId?)`
+returns true when `actor`'s highest role is strictly above `target`'s, or
+`actor` is the owner.
 It returns false when `target` is the owner. Checking this before acting turns
 Discord's bare 403 into a sentence the user can do something about.
 
@@ -232,10 +274,9 @@ client:command("ban", function(ix: Discord.Interaction)
 		return
 	end
 	local actor = ix.member
-	local targetMember = ix:getMember("user") -- nil if they aren't in the server
+	local targetMember = ix:getMember("user") -- nil if they aren't in the server; `user` filled in
 	local guild = client.cache:getGuild(guildId)
 	if actor ~= nil and targetMember ~= nil and guild ~= nil then
-		targetMember.user = target -- resolved members come without `user`
 		if not Permissions.outranks(guild, actor, targetMember, client.cache:getRoles(guildId)) then
 			ix:replyEphemeral("You can only ban members below your highest role.")
 			return
@@ -263,7 +304,8 @@ messages, use `forChannel` or `ix:appPermissions()`.
 
 ## Permission names
 
-These are the names `Permissions.of` accepts, with their bit positions. The
+These are the names `Permissions.of`, `Bitfield.fromName` and the
+`Bitfield` methods accept, with their bit positions. The
 source of truth is `Const.PermissionBits` in `src/const.luau`.
 
 | Name | Bit | Name | Bit |

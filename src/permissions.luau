@@ -21,6 +21,7 @@
 ]]
 local Bitfield = require("@discord/bitfield")
 local Const = require("@discord/const")
+local Log = require("@discord/log")
 local Types = require("@discord/types")
 
 type Bits = Bitfield.Bitfield
@@ -46,16 +47,11 @@ end)()
 --- Combines permission names into one field: `Permissions.of("kickMembers",
 --- "banMembers")`. Unknown names throw rather than being ignored, because a
 --- typo'd permission name that silently means "no permission" produces a bot
---- that lets everyone through.
+--- that lets everyone through. The error names the likely intended one.
 function Permissions.of(...: string): Bits
 	local field = Bitfield.empty
 	for index = 1, select("#", ...) do
-		local name = select(index, ...)
-		local flag = Flags[name]
-		if flag == nil then
-			error(`unknown permission "{name}"`, 2)
-		end
-		field = field:union(flag)
+		field = field:union(Bitfield.fromName((select(index, ...))))
 	end
 	return field
 end
@@ -89,11 +85,53 @@ function Permissions.has(field: Bits, permission: string | Bits): boolean
 	return field:has(wanted)
 end
 
---- Guild-wide permissions for a member: @everyone plus every role held.
---- Owners get everything, as does anyone with ADMINISTRATOR.
-function Permissions.forMember(guild: Types.Guild, member: Types.Member, roles: { [string]: Types.Role }?): Bits
-	local userId = member.user and member.user.id
-	if userId ~= nil and guild.owner_id == userId then
+local warnedAnonymous = false
+
+--[[
+	Whose member object this is.
+
+	A member only names its user through `member.user`, and the members an
+	interaction resolves (`data.resolved.members`, a select's picks) arrive
+	WITHOUT it -- the user sits in a sibling map. Such a member cannot be
+	recognised as the guild owner or matched to its own channel overwrite,
+	so the owner would be judged by roles alone. An explicit `userId` fills
+	the gap; without one, a single warning says why a check may come out
+	short, rather than every call guessing silently.
+]]
+local function memberId(member: Types.Member, userId: string?, what: string): string?
+	if userId ~= nil then
+		return userId
+	end
+	local user = member.user
+	if user ~= nil then
+		return user.id
+	end
+	if not warnedAnonymous then
+		warnedAnonymous = true
+		Log.warn(
+			`Permissions.{what} got a member with no \`user\` and no userId; the guild owner and member `
+				.. "overwrites cannot be recognised. Pass the user id, or use ix:getMember / ix:selectedMembers, "
+				.. "which splice the user back in."
+		)
+	end
+	return nil
+end
+
+--[[
+	Guild-wide permissions for a member: @everyone plus every role held.
+	Owners get everything, as does anyone with ADMINISTRATOR.
+
+	`userId` is for members that lack `user` (see `memberId`); when given it
+	wins over `member.user`.
+]]
+function Permissions.forMember(
+	guild: Types.Guild,
+	member: Types.Member,
+	roles: { [string]: Types.Role }?,
+	userId: string?
+): Bits
+	local id = memberId(member, userId, "forMember")
+	if id ~= nil and guild.owner_id == id then
 		return Permissions.ALL
 	end
 
@@ -159,22 +197,24 @@ end
 
 --[[
 	Effective permissions for a member in a channel. See the module comment
-	for the ordering; every step of it is load-bearing.
+	for the ordering; every step of it is load-bearing. `userId` is as for
+	`forMember`, and here it also finds the member's own overwrite.
 ]]
 function Permissions.forChannel(
 	guild: Types.Guild,
 	member: Types.Member,
 	channel: Types.Channel,
-	roles: { [string]: Types.Role }?
+	roles: { [string]: Types.Role }?,
+	userId: string?
 ): Bits
-	local base = Permissions.forMember(guild, member, roles)
+	local id = memberId(member, userId, "forChannel")
+	local base = Permissions.forMember(guild, member, roles, id)
 	if base:has(Flags.administrator) then
 		return Permissions.ALL
 	end
 
 	local overwrites = channel.permission_overwrites
 	if overwrites ~= nil then
-		local userId = member.user and member.user.id
 		local everyone, roleAllow, roleDeny, memberOverwrite = nil, Bitfield.empty, Bitfield.empty, nil
 		local held: { [string]: boolean } = {}
 		for _, roleId in member.roles do
@@ -187,7 +227,7 @@ function Permissions.forChannel(
 			elseif overwrite.type == Const.OverwriteType.ROLE and held[overwrite.id] then
 				roleDeny = roleDeny:union(Bitfield.fromString(overwrite.deny))
 				roleAllow = roleAllow:union(Bitfield.fromString(overwrite.allow))
-			elseif overwrite.type == Const.OverwriteType.MEMBER and overwrite.id == userId then
+			elseif overwrite.type == Const.OverwriteType.MEMBER and id ~= nil and overwrite.id == id then
 				memberOverwrite = overwrite
 			end
 		end
@@ -223,19 +263,24 @@ end
 	role-editing someone whose highest role is at or above your own, and the
 	guild owner outranks everyone regardless of roles. Checking first turns a
 	403 into a sentence the user can act on.
+
+	`actorId` and `targetId` are for members that lack `user` (see
+	`memberId`), which is how a resolved interaction member arrives.
 ]]
 function Permissions.outranks(
 	guild: Types.Guild,
 	actor: Types.Member,
 	target: Types.Member,
-	roles: { [string]: Types.Role }?
+	roles: { [string]: Types.Role }?,
+	actorId: string?,
+	targetId: string?
 ): boolean
-	local actorId = actor.user and actor.user.id
-	local targetId = target.user and target.user.id
-	if actorId ~= nil and guild.owner_id == actorId then
+	local actorKey = memberId(actor, actorId, "outranks")
+	local targetKey = memberId(target, targetId, "outranks")
+	if actorKey ~= nil and guild.owner_id == actorKey then
 		return true
 	end
-	if targetId ~= nil and guild.owner_id == targetId then
+	if targetKey ~= nil and guild.owner_id == targetKey then
 		return false
 	end
 

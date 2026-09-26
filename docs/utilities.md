@@ -328,11 +328,12 @@ A small levelled logger that the whole library shares. Lines go to stdout
 and, optionally, to a file:
 
 ```text
-14:02:31 INFO	[mybot] shard 0: resumed
+2026-09-26 14:02:31 INFO	[mybot] shard 0: resumed
 ```
 
-The time is UTC. The bracketed prefix is set to the bot's username when it
-connects.
+The date and time are UTC. The date is there because a bot's log outlives
+the day it started, and a bare time can't say which night the crash was.
+The bracketed prefix is set to the bot's username when it connects.
 
 | Function | Does |
 | --- | --- |
@@ -341,6 +342,7 @@ connects.
 | `Log.setFile(path?)` | Also append every line to `path`. `nil` turns the file off. |
 | `Log.setPrefix(text?)` | A tag printed before every message. |
 | `Log.enabled(level)` | Whether a level would print. Guard expensive messages with it. |
+| `Log.setHook(fn?)` | Also call `fn(level, message)` for every line that passes the level. `nil` removes it. |
 
 **Why the file matters.** Lute block-buffers stdout whenever it isn't
 attached to a terminal, which is every way a bot runs for real: under
@@ -353,6 +355,36 @@ The file is opened, appended to and closed for every line. That's slower
 than holding it open, but it means log rotation that moves the file away
 just works: the next line creates a new one. A failure to write the file is
 ignored, because logging should never be what takes a bot down.
+
+**Hooking the log.** `Log.setHook(fn)` calls `fn(level, message)` after
+each line is printed, for every line at or above the current level. `level`
+is `"debug"`, `"info"`, `"warn"` or `"error"`, and `message` is the text
+alone, without the timestamp, level or prefix. Use it to forward warnings
+to a log channel or an error tracker, or in a test, to assert that a
+warning was given. A hook that throws is ignored. There's one hook at a
+time, and setting another replaces it.
+
+The hook runs inside whatever code logged, so hand slow work off to its own
+task. And if it sends to Discord, skip the REST layer's own lines (retries
+and rate limits, which start with an HTTP method or mention "rate
+limited"): a send that gets rate limited would log, and the hook would send
+that line too.
+
+```luau
+local task = require("@lute/task")
+
+local LOG_CHANNEL = "123456789012345678"
+
+Log.setHook(function(level, message)
+	if level ~= "warn" and level ~= "error" then
+		return
+	end
+	if string.find(message, "rate limited", 1, true) or string.find(message, "^%u+ /") then
+		return
+	end
+	task.spawn(pcall, client.send, client, LOG_CHANNEL, `**{level}** {string.sub(message, 1, 1900)}`)
+end)
+```
 
 `Client.new` sets the level and file from its `logLevel` and `logFile`
 options, but only the ones you pass. Leave one out and whatever you set

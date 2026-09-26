@@ -24,6 +24,9 @@ local collector = Collector.new(client, {
 	messageId = "m1",
 	userId = "u1",
 	timeout = 0,
+	-- Off here so another user's click falls through; the default "not
+	-- for you" reply is covered in dx.test.luau.
+	othersMessage = false,
 	onCollect = function(event: any)
 		table.insert(collected, event.data.custom_id)
 	end,

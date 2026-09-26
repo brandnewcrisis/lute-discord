@@ -1,19 +1,27 @@
 # Commands
 
-A command has two halves that live in different places:
+A command has two halves:
 
 - The **definition**: name, description, options. You build it with
   `Discord.Commands` and upload it with `client:deploy`. Discord stores it
   and draws the `/` menu from it.
 - The **handler**: the function that runs when someone uses the command.
-  You register it with `client:command`. It never leaves your process.
+  It never leaves your process.
 
 Discord never sees your handler, and your handler never sees the
-definition. That split explains most of this page. Discord checks a
-definition strictly, but only when you deploy it, and it rejects the whole
-batch over one bad name. So the builders check Discord's rules as you call
-them, and a mistake fails on your line with a message that names the rule
-instead of an `Invalid Form Body` from the API.
+definition. Two things follow from that split, and they explain most of
+this page.
+
+First, Discord checks a definition strictly, but only when you deploy it,
+and it rejects the whole batch over one bad name. So the builders check
+Discord's rules as you call them, and a mistake fails on your line with a
+message that names the rule instead of an `Invalid Form Body` from the API.
+
+Second, the two halves drift. Rename an option in the definition and a
+handler in another file keeps reading the old name. So a handler can live
+on the builder itself, with `:handle`, and after every deploy the client
+warns about any published command with no handler and any handler with no
+published command.
 
 ```luau
 --!strict
@@ -22,15 +30,15 @@ local Commands = Discord.Commands
 
 local client = Discord.Client.new({ token = "...", intents = { "guilds" } })
 
-client:command("roll", function(ix: Discord.Interaction)
-	local sides = ix:opt("sides", 6)
-	ix:reply(`You rolled {math.random(1, sides)}.`)
-end)
+local roll = Commands.slash("roll", "Roll a die")
+	:integerOption("sides", "How many sides", { min = 2, max = 100 })
+	:handle(function(ix)
+		local sides = ix:getInteger("sides") or 6
+		ix:reply(`You rolled {math.random(1, sides)}.`)
+	end)
 
-client:deploy({
-	Commands.slash("roll", "Roll a die")
-		:integerOption("sides", "How many sides", { min = 2, max = 100 }),
-})
+client:register(roll) -- routes the handler
+client:deploy() -- publishes everything registered
 ```
 
 ## Slash commands
@@ -55,14 +63,14 @@ with the shorthand methods, each taking `(name, description, extra?)`:
 
 | Method | The user enters | Read it with |
 | --- | --- | --- |
-| `stringOption` | text | `ix:opt(name)` (a string) |
-| `integerOption` | a whole number | `ix:opt(name)` (a number) |
-| `numberOption` | a number, decimals allowed | `ix:opt(name)` (a number) |
-| `booleanOption` | True or False | `ix:opt(name)` (a boolean) |
+| `stringOption` | text | `ix:getString`, `ix:requireString` |
+| `integerOption` | a whole number | `ix:getInteger`, `ix:requireInteger` |
+| `numberOption` | a number, decimals allowed | `ix:getNumber`, `ix:requireNumber` |
+| `booleanOption` | True or False | `ix:getBoolean`, `ix:requireBoolean` |
 | `userOption` | a user, from a picker | `ix:getUser`, `ix:getMember`, `ix:requireUser`, `ix:requireMember` |
 | `channelOption` | a channel | `ix:getChannel`, `ix:requireChannel` |
 | `roleOption` | a role | `ix:getRole`, `ix:requireRole` |
-| `mentionableOption` | a user or a role | `ix:getUser`, then `ix:getRole` |
+| `mentionableOption` | a user or a role | `ix:getMentionable`, `ix:requireMentionable` |
 | `attachmentOption` | an uploaded file | `ix:getAttachment`, `ix:requireAttachment` |
 
 ```luau
@@ -71,8 +79,10 @@ Commands.slash("tip", "Tip someone")
 	:numberOption("amount", "How much", { required = true, min = 0.01 })
 ```
 
-A `mentionable` option's value is an ID that could be a user or a role. Try
-`ix:getUser(name)`, and if that's nil, `ix:getRole(name)`.
+A `mentionable` option's value is an ID that could be a user or a role.
+`ix:getMentionable(name)` works out which, and returns a record whose `kind`
+is `"user"` or `"role"`. See
+[interactions.md](interactions.md#mentionables).
 
 The shorthands wrap the general `option` method, which takes the same
 fields as one table, plus a `type`: one of `"string"`, `"integer"`,
@@ -85,7 +95,8 @@ Commands.slash("tip", "Tip someone")
 ```
 
 [interactions.md](interactions.md#reading-options) covers reading options in
-detail, including why `require*` exists.
+detail, including why the typed getters check the option's type and why
+`require*` exists.
 
 ### Extra settings
 
@@ -141,6 +152,13 @@ translated name (see [Localization](#localization)).
 These mistakes throw when you call the builder, not when you deploy:
 
 - A name or description that breaks the rules above.
+- A misspelled key in an option spec or an `extra` table. Luau accepts an
+  unknown key in a table literal without complaint, so `{ min_value = 2 }`
+  would typecheck, run, and do nothing. The error names the key you
+  probably meant: `option "sides" has no option "min_value"; did you mean
+  "min"?`. Discord's own field names (`min_value`, `max_length`,
+  `channel_types` and the rest), which are what the API reference and most
+  JSON examples show, are recognised and pointed at the builder's names.
 - An unknown option `type`.
 - A setting on a type it doesn't apply to (see the table above), such as
   `min` on a string or `channelTypes` on a role option.
@@ -153,7 +171,9 @@ These mistakes throw when you call the builder, not when you deploy:
 - Plain options mixed with subcommands or groups at the same level (see
   [below](#subcommands-and-groups)).
 - A group nested inside a group.
-- An unknown permission name in `defaultPermissions`.
+- A handler on a group (see [Handlers](#handlers)).
+- An unknown permission name in `defaultPermissions`, with the likely
+  intended name.
 
 The error is raised at the first stack frame outside the library, so it
 names the line in your bot that made the mistake, not a line in
@@ -165,8 +185,8 @@ Choices top out at 25 and have to be known when you deploy. Autocomplete
 lifts both limits. Discord asks your bot for suggestions on each keystroke,
 and you answer with up to 25 of them.
 
-Mark the option with `autocomplete = true`, then register a handler with
-`client:autocomplete`:
+Mark the option with `autocomplete = true`, then give the command an
+autocomplete handler with `:onAutocomplete`:
 
 ```luau
 --!strict
@@ -178,38 +198,42 @@ local client = Discord.Client.new({ token = "...", intents = { "guilds" } })
 
 local CITIES = { "Amsterdam", "Berlin", "Lisbon", "London", "Paris", "Prague" }
 
-client:autocomplete("weather", function(ix: Discord.Interaction)
-	local _, typed = ix:focused()
-	local needle = string.lower(tostring(typed or ""))
-	local choices: { Types.AutocompleteChoice } = {}
-	for _, city in CITIES do
-		if string.find(string.lower(city), needle, 1, true) then
-			table.insert(choices, { name = city, value = city })
+local weather = Commands.slash("weather", "Look up a city")
+	:stringOption("city", "Start typing", { required = true, autocomplete = true })
+	:onAutocomplete(function(ix)
+		local _, typed = ix:focused()
+		local needle = string.lower(tostring(typed or ""))
+		local choices: { Types.AutocompleteChoice } = {}
+		for _, city in CITIES do
+			if string.find(string.lower(city), needle, 1, true) then
+				table.insert(choices, { name = city, value = city })
+			end
 		end
-	end
-	ix:autocomplete(choices)
-end)
+		ix:autocomplete(choices)
+	end)
+	:handle(function(ix)
+		local city = ix:requireString("city")
+		if not table.find(CITIES, city) then
+			return ix:replyEphemeral("I don't know that city.")
+		end
+		ix:reply(`It is always sunny in {city}.`)
+	end)
 
-client:command("weather", function(ix: Discord.Interaction)
-	local city: string = ix:requireOpt("city")
-	if not table.find(CITIES, city) then
-		ix:replyEphemeral("I don't know that city.")
-		return
-	end
-	ix:reply(`It is always sunny in {city}.`)
-end)
-
-client:deploy({
-	Commands.slash("weather", "Look up a city")
-		:stringOption("city", "Start typing", { required = true, autocomplete = true }),
-})
+client:register(weather)
+client:deploy()
 ```
+
+`client:autocomplete(path, handler, commandType?)` does the same without a
+builder, the way `client:command` does for command handlers (see
+[Routing](#routing)).
 
 Things to know:
 
 - `ix:focused()` returns the name of the option being typed and its value so
   far. When a command has several autocomplete options, one handler can
-  branch on the name.
+  branch on the name. On a numeric option the value so far is the raw text;
+  `ix:getInteger` and `ix:getNumber` parse it, and return nil while it isn't
+  a number yet (`""`, `"-"`).
 - `ix:autocomplete(choices)` sends the list. Anything past 25 is dropped.
 - Suggestions aren't a constraint. The user can ignore them and submit any
   text, so validate the value in the command handler, as the example does.
@@ -238,8 +262,9 @@ Commands.slash("tag", "Saved snippets")
 	:subcommand("list", "Every tag on this server")
 ```
 
-`subcommand(name, description, build?)` hands `build` a fresh builder for the
-subcommand's own options. Leave `build` out when it takes none.
+`subcommand(name, description, build?)` hands `build` a fresh builder, on
+which you add the subcommand's own options and its handler (see
+[Handlers](#handlers)). Leave `build` out when there's nothing to add.
 
 A group adds one more level (`/config roles add`):
 
@@ -283,22 +308,21 @@ The handler reads the target from the interaction:
 ```luau
 --!strict
 local Discord = require("@discord")
+local Commands = Discord.Commands
 local client = Discord.Client.new({ token = "...", intents = { "guilds" } })
 
-client:command("Show avatar", function(ix: Discord.Interaction)
+local avatar = Commands.userCommand("Show avatar"):handle(function(ix)
 	local user = ix:targetUser()
 	if user == nil then
-		ix:replyEphemeral("Discord did not say who that was.")
-		return
+		return ix:replyEphemeral("Discord did not say who that was.")
 	end
 	ix:replyEphemeral(Discord.Api.cdn.userAvatar(user, { size = 512 }))
 end)
 
-client:command("Quote this", function(ix: Discord.Interaction)
+local quote = Commands.messageCommand("Quote this"):handle(function(ix)
 	local message = ix:targetMessage()
 	if message == nil then
-		ix:replyEphemeral("Discord did not send the message.")
-		return
+		return ix:replyEphemeral("Discord did not send the message.")
 	end
 	ix:reply({
 		content = `<@{message.author.id}> said:\n>>> {message.content}`,
@@ -306,14 +330,15 @@ client:command("Quote this", function(ix: Discord.Interaction)
 		allowed_mentions = Discord.Payload.NO_MENTIONS,
 	})
 end)
+
+client:register(avatar, quote)
 ```
 
 Discord includes the target message's content even without the Message
 Content intent: the user chose to show it to your bot.
 
-Routing is by name alone. A slash command `info` and a user command `info`
-would share one handler, so give context menus names that can't collide.
-Capitals and spaces make that easy.
+Handlers are kept per command type, so a slash command `info` and a user
+command `info` can each have their own. See [Routing](#routing).
 
 ## Command settings
 
@@ -337,13 +362,16 @@ the command to whoever they choose. If a command must not run without a
 permission, check at invoke time as well:
 
 ```luau
-client:command("purge", function(ix: Discord.Interaction)
-	if not Discord.Permissions.has(ix:memberPermissions(), "manageMessages") then
-		ix:replyEphemeral("You need Manage Messages for that.")
-		return
-	end
-	-- ...
-end)
+Commands.slash("purge", "Delete recent messages")
+	:integerOption("count", "How many", { required = true, min = 1, max = 100 })
+	:defaultPermissions("manageMessages")
+	:guildOnly()
+	:handle(function(ix)
+		if not Discord.Permissions.has(ix:memberPermissions(), "manageMessages") then
+			return ix:replyEphemeral("You need Manage Messages for that.")
+		end
+		-- ...
+	end)
 ```
 
 `ix:memberPermissions()` is computed by Discord for the channel the command
@@ -404,9 +432,107 @@ Commands.slash("hello", "Say hello")
 	})
 ```
 
+## Handlers
+
+### `handle` and `onAutocomplete`
+
+`:handle(fn)` attaches the function that answers a command. Called on the
+builder a `subcommand` callback receives, it attaches that subcommand's:
+
+```luau
+local tag = Commands.slash("tag", "Saved snippets")
+	:subcommand("get", "Show a tag", function(sub)
+		sub:stringOption("name", "Which tag", { required = true, autocomplete = true })
+		sub:handle(function(ix)
+			ix:reply(`You asked for {ix:requireString("name")}.`)
+		end)
+		sub:onAutocomplete(function(ix)
+			ix:autocomplete({ { name = "rules", value = "rules" } })
+		end)
+	end)
+	:subcommand("list", "Every tag on this server", function(sub)
+		sub:handle(function(ix)
+			ix:reply("No tags yet.")
+		end)
+	end)
+```
+
+- `:onAutocomplete(fn)` attaches the autocomplete handler for the command or
+  subcommand. It runs for every option marked `autocomplete = true`, and
+  `ix:focused()` says which one the user is typing in.
+- A command with subcommands may have a `:handle` of its own too. It
+  answers any subcommand that has no handler.
+- A group can't take a handler. Discord only ever invokes the subcommands
+  inside a group, never the group, so a handler there could never run, and
+  the builder says so: `group "roles" cannot have a handler; put one on each
+  of its subcommands`.
+- A handler is a `Discord.Handler`: `(Discord.Interaction) -> ...any`. The
+  return value is ignored. It's `...any` so that `return ix:reply(...)`
+  typechecks, which makes an early exit one line.
+
+### `client:register`
+
+A handler on a builder does nothing until the client knows about it.
+`client:register` walks each builder, files every handler under its full
+path and command type, and remembers the builders, so `client:deploy()`
+with no list publishes exactly what was registered. It takes the builders as
+arguments, or as one list:
+
+```luau
+client:register(ping, tag, weather) -- builders as arguments
+client:register(commands) -- one list, typically from a module
+```
+
+Prefer the argument form when you write builders inline. Luau 1.0.0 doesn't
+carry the expected type into a function nested inside a table literal, so
+this fails to typecheck:
+
+```luau
+client:register({
+	Commands.slash("ping", "Check I am alive"):handle(function(ix)
+		ix:reply("pong") -- error: `ix` isn't inferred inside a table literal
+	end),
+})
+```
+
+The same builder passed as an argument infers `ix` as a
+`Discord.Interaction`. Inside a table literal, annotate every function
+parameter yourself: `function(ix: Discord.Interaction)`, and
+`function(sub: Discord.Command)` for a `subcommand` callback.
+
+A list assembled in a module is fine, because each handler is written as an
+argument to `:handle` in its own file and only the finished builder goes in
+the list:
+
+```luau
+--!strict
+-- commands/init.luau
+local Discord = require("@discord")
+
+local commands: { Discord.Command } = {
+	require("@bot/commands/ping"),
+	require("@bot/commands/tag"),
+}
+
+return commands
+```
+
+A few more rules:
+
+- `register` returns the builders it registered, as a list.
+- Registering the same builder twice is harmless: handlers are keyed by
+  path, and a builder already remembered isn't added again.
+- It only takes builders. A plain command table carries no handler, so
+  `register` rejects one. Publish those with `client:deploy(list)` and route
+  them with `client:command`.
+- `Commands.handlers(command)` returns what `register` reads: a list of
+  `{ path, type, run?, autocomplete? }`, one per handler on the builder and
+  its subcommands. It's there for a bot with its own router.
+
 ## Routing
 
-`client:command(path, handler)` registers a handler and returns the client.
+`client:command(path, handler, commandType?)` registers a handler without a
+builder, and returns the client. `register` goes through the same routing.
 
 For a plain command the path is its name. For subcommands it's the full path,
 space-separated, exactly as the user sees it:
@@ -418,7 +544,8 @@ client:command("config roles add", function(ix: Discord.Interaction) end)
 ```
 
 Routing tries the full path first, then falls back to the bare command name.
-So you can handle every subcommand in one place:
+So you can handle every subcommand in one place (with a builder, that's a
+`:handle` on the command itself):
 
 ```luau
 client:command("tag", function(ix: Discord.Interaction)
@@ -434,13 +561,32 @@ end)
 and mix the two: a specific path wins over the bare name, so `"tag get"` can
 have its own handler while `"tag"` catches the rest.
 
-A few more rules:
+### Command types
 
-- Registering the same path twice replaces the first handler.
+Handlers are kept per command type, so a slash command `/info` and a user
+context menu called "info" don't collide. `register` always knows the type
+from the builder. `client:command` without a `commandType` answers its path
+for every type that has no handler of its own. Pass one to scope it:
+
+```luau
+client:command("info", function(ix: Discord.Interaction)
+	ix:replyEphemeral(`That is {(ix:targetUser() or ix.user).username}.`)
+end, Discord.Const.CommandType.USER)
+```
+
+The order routing tries, most specific first: a handler for this type and
+the full path, an untyped one for the full path, then the same two for the
+bare command name. The bare-name step is for slash commands only, since a
+context menu's name is one unit, spaces and all.
+
+### Other rules
+
+- Registering the same path (and type) twice replaces the first handler.
 - If nothing matches, the library logs a warning and replies ephemerally
   with ``/path` is not wired up on this bot.``, so the user doesn't see "The
-  application did not respond". This is usually a command you deployed but
-  haven't written yet, or one left over from an old deploy.
+  application did not respond". The post-deploy check (see
+  [below](#handler-and-command-mismatches)) usually tells you before a user
+  does.
 - Every handler runs on its own task, so a slow handler doesn't hold up the
   others. If it throws, the error is contained and reported; see
   [interactions.md](interactions.md#when-a-handler-throws).
@@ -448,14 +594,19 @@ A few more rules:
 ## Deploying
 
 ```text
-client:deploy(commands: { Command | ApplicationCommand }, guildId: string?) -> { ApplicationCommand }
+client:deploy(commands: { Command | ApplicationCommand }?, guildId: string?) -> { ApplicationCommand }
 ```
 
-`deploy` uploads a list of commands and returns what Discord stored (a list
-of `Types.ApplicationCommand` from `@discord/types`, with the IDs Discord
-assigned). The
-list can hold builders or plain tables in Discord's own shape.
+`deploy` uploads commands and returns what Discord stored (a list of
+`Types.ApplicationCommand` from `@discord/types`, with the IDs Discord
+assigned).
 
+- **With no list** (`client:deploy()`, or `client:deploy(nil, guildId)`), it
+  publishes every builder given to `client:register`. Calling it before
+  anything was registered is an error.
+- **With a list**, it publishes that list as given and ignores what was
+  registered. The list can hold builders or plain tables in Discord's own
+  shape.
 - **With a `guildId`**, the commands go to that one server and appear
   instantly. Use this while developing.
 - **Without one**, they're global: every server the bot is in, plus DMs.
@@ -465,6 +616,27 @@ list can hold builders or plain tables in Discord's own shape.
 Global and guild commands are separate lists, and a user in your test server
 sees both. When you go global, clear the guild list with
 `client:deploy({}, guildId)` or every command shows up twice.
+
+### Handler and command mismatches
+
+After each deploy, the client compares what it published with the handlers
+it has, and logs a warning for each mismatch:
+
+```text
+WARN	/role remove is deployed but has no handler; users will see "not wired up"
+WARN	handler for /pign is registered but no such command was deployed; typo? (did you mean /ping?)
+```
+
+Both are silent otherwise until a user tries the command. The second is
+nearly always a typo, and its real command then shows up as the first.
+Autocomplete handlers are checked the same way. Each mismatch is reported
+once per client. A handler counts as matched by any deploy so far, so a bot
+that publishes some commands to a guild and the rest globally isn't told
+its guild handlers are orphans by the global deploy.
+
+The check knows the handlers from `register`, `client:command` and
+`client:autocomplete`. Builders passed straight to `deploy(list)` count
+too: `deploy` registers the handlers they carry before publishing.
 
 ### Bulk overwrite, and why it's the only deploy you need
 
@@ -488,9 +660,11 @@ Lute prints nothing useful for an uncaught error object at the top level.
 The returned IDs let you mention a command as a clickable link:
 
 ```luau
-local deployed = client:deploy({ Commands.slash("help", "How to use me") })
-local help = deployed[1]
-print(`</{help.name}:{help.id}>`) -- paste into a message to get a clickable /help
+for _, command in client:deploy() do
+	if command.name == "help" then
+		print(`</{command.name}:{command.id}>`) -- paste into a message to get a clickable /help
+	end
+end
 ```
 
 ### Deploying from CI
@@ -504,34 +678,23 @@ For a bot that's running for real, deploy as a separate step:
 - A global deploy takes time to spread, so you want to do it once, on
   purpose.
 
-Keep the definitions in their own module so the bot and the deploy script
-share them:
-
-```luau
---!strict
--- commands.luau
-local Discord = require("@discord")
-local Commands = Discord.Commands
-
-local list: { Discord.Command } = {
-	Commands.slash("ping", "Check I am alive"),
-	Commands.slash("roll", "Roll a die"):integerOption("sides", "How many sides", { min = 2, max = 100 }),
-}
-
-return list
-```
+Keep the commands in their own module, as the `commands/init.luau` above
+does, so the bot and the deploy script share them. The deploy script
+registers them too, even though it never runs a handler: that's what lets
+the mismatch check see the handlers and stay quiet.
 
 ```luau
 --!strict
 -- deploy.luau: `lute run deploy.luau` publishes the commands and exits.
 local Discord = require("@discord")
-local commands = require("./commands")
+local commands = require("@bot/commands")
 
 local env = Discord.Env.load()
 local client = Discord.Client.new({ token = env:require("DISCORD_TOKEN"), intents = {} })
 
+client:register(commands)
 -- Guild when DISCORD_GUILD_ID is set, global otherwise.
-client:deploy(commands, env:get("DISCORD_GUILD_ID"))
+client:deploy(nil, env:get("DISCORD_GUILD_ID"))
 ```
 
 `deploy` only talks to the REST API, so the script never opens a gateway
@@ -540,6 +703,8 @@ by `Client.new` but unused here. Run it from your pipeline with the token
 supplied as a secret environment variable. An error ends the script with a
 non-zero exit code, which fails the job.
 
-The bot itself then just registers handlers and calls `client:run()`.
+The bot itself then calls `client:register(commands)` and `client:run()`,
+and no `deploy`. The mismatch check runs after a deploy, so it happens in
+the deploy script's output, not the bot's.
 [deploying.md](deploying.md#deploying-commands-from-ci) shows this step in a
 pipeline alongside the rest of a release.

@@ -5,7 +5,72 @@ All notable changes to this project. The format follows
 [Semantic Versioning](https://semver.org/), and while the version is 0.x a
 minor release may change the API.
 
-## [0.3.0] - Unreleased
+## [0.4.0] - Unreleased
+
+Developer experience: most of the ways a bot fails silently now fail loudly,
+on the line that caused them.
+
+### Added
+
+- **Typed events.** `client:on`, `once` and `waitFor` infer the listener's
+  parameter types from the event name, and reject a wrong annotation. Custom
+  event names still work. `Discord.Events` holds the event registry.
+- **Handlers on command builders.** `Commands.slash(...):handle(fn)`,
+  `sub:handle(fn)` inside a subcommand, and `:onAutocomplete(fn)`.
+  - `client:register(a, b, ...)` or `client:register(list)` wires them up.
+  - `client:deploy()` with no list publishes everything registered.
+  - Builders passed to `deploy(list)` have their handlers registered too.
+  - `Commands.handlers(command)` lists the handlers a builder carries.
+- **Startup warnings.**
+  - A listener for an event none of your intents deliver ("will never
+    fire"), naming the intent and whether it is privileged.
+  - A misspelled event name, with a suggestion.
+  - `messageCreate` without `messageContent`, since content will be empty.
+  - Deployed commands with no handler, and handlers with no deployed
+    command.
+  - A collector that isn't scoped to a message.
+- **Typo checks on option tables.** This covers command options, every
+  component constructor, collectors, the paginator and `Client.new`.
+  Discord's wire names are recognised, so `min_value` gets "did you mean
+  `min`?".
+- **Typed option getters.** `ix:getString`, `getInteger`, `getNumber` and
+  `getBoolean`, with `require*` variants that check the option's real type,
+  plus `getMentionable`.
+- **Select helpers.** `ix:selectedUsers`, `selectedMembers`, `selectedRoles`
+  and `selectedChannels` for select menus on messages.
+- **`showErrors` client option.** Shows the error's first line to the user
+  while you develop.
+- **`tools/new.luau`.** Scaffolds a working bot project around the library.
+- **Collector `othersMessage`.** Other people clicking someone else's buttons
+  now get an ephemeral "These buttons aren't for you." instead of a button
+  that silently does nothing.
+- **Builder additions.** `numberOption`, `mentionableOption` and
+  `Command:userInstallable()`.
+- **Permission names.** `Bitfield` methods accept permission names
+  (`field:has("banMembers")`), and there is `Bitfield.fromName`.
+- **Optional user ids** on `Permissions.forMember`, `forChannel` and
+  `outranks`, for interaction members that lack `user`.
+- **Logging.** `Log.setHook` forwards log lines. Log lines now include the
+  date.
+
+### Changed
+
+- **`ix.client` is typed with `cache` and `user`**, not just `api`.
+- **Handlers are typed `(Interaction) -> ...any`**, so a handler can end
+  with `return ix:reply(...)`.
+- **Command routing considers the command type.** A slash `/info` and a
+  user context menu named "info" no longer share a handler.
+- **A subcommand group can't take a handler.** Discord never invokes a group
+  directly, so this is now an error.
+
+### Fixed
+
+- **`onCollect` errors.** A collector's `onCollect` that throws now answers
+  the user instead of leaving "interaction failed".
+- **Inline paginator pages.** `table.insert(pages, Embed.new():setTitle(...))`
+  now typechecks.
+
+## [0.3.0] - 2026-09-26
 
 The first public release.
 

@@ -1,0 +1,32 @@
+--!strict
+local Spec = require("@discord/spec")
+local h = require("./harness")
+
+local KEYS = Spec.keys({ "id", "label", "min", "max", "minLength", "placeholder" })
+
+h.check("known keys pass", pcall(function()
+	Spec.check({ id = "a", label = "b" }, KEYS, "button")
+end))
+h.check("an array part is ignored", pcall(function()
+	Spec.check({ "positional" }, KEYS, "row")
+end))
+
+h.throws("an unknown key is named", 'button has no option "colour"', function()
+	Spec.check({ colour = 1 }, KEYS, "button")
+end)
+h.throws("snake_case suggests camelCase", 'did you mean "minLength"', function()
+	Spec.check({ min_length = 1 }, KEYS, "option")
+end)
+h.throws("an alias maps Discord's wire name", 'did you mean "id"', function()
+	Spec.check({ custom_id = "x" }, KEYS, "button", { custom_id = "id" })
+end)
+h.throws("a near miss is suggested", 'did you mean "placeholder"', function()
+	Spec.check({ placeholdr = "x" }, KEYS, "select")
+end)
+h.throws("the error names the caller's line", "spec.test.luau", function()
+	Spec.check({ nope = true }, KEYS, "thing")
+end)
+h.equals("nothing plausible means no suggestion", Spec.suggest("zzzzzzzz", KEYS), nil)
+h.equals("min_value has no camel match but aliases can supply one", Spec.suggest("min_value", KEYS, { min_value = "min" }), "min")
+
+h.finish()

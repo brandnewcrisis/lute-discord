@@ -12,6 +12,9 @@
 
 	Values are immutable; every operation returns a new field.
 ]]
+local blame = require("@discord/blame")
+local Const = require("@discord/const")
+local Spec = require("@discord/spec")
 
 local Bitfield = {}
 Bitfield.__index = Bitfield
@@ -56,9 +59,9 @@ function Bitfield.fromString(text: string): Bitfield
 	for index = 1, #text do
 		local digit = string.byte(text, index) - 48
 		if digit < 0 or digit > 9 then
-			-- The usual way here is `field:has("banMembers")`: a Bitfield
-			-- knows numbers, not permission names.
-			error(`not a decimal integer: "{text}" (for permission names, use Permissions.has)`, 2)
+			-- Names are `coerce`'s job (so `field:has("banMembers")` works);
+			-- a caller reaching this directly has a string that is neither.
+			error(`not a decimal integer: "{text}"`, blame())
 		end
 		lo = lo * 10 + digit
 		local carry = math.floor(lo / TWO32)
@@ -68,9 +71,45 @@ function Bitfield.fromString(text: string): Bitfield
 	return make(hi, lo)
 end
 
---- Accepts whichever of the three representations turned up.
+-- Permission names as a key set, for suggesting the intended one when a
+-- name is misspelt. `Const` and `Spec` require nothing that comes back
+-- here, so this module stays a leaf for `Permissions` to build on.
+local PERMISSION_NAMES = (function(): Spec.Keys
+	local names = {}
+	for name in Const.PermissionBits :: { [string]: number } do
+		table.insert(names, name)
+	end
+	return Spec.keys(names)
+end)()
+
+--[[
+	A permission name as a single-bit field, e.g. `"banMembers"`.
+
+	A typo here must not quietly mean "no bits": `field:has("banMemebrs")`
+	returning true for everyone (the empty mask is contained in every field)
+	is the classic permission-check hole. So an unknown name throws, naming
+	the one that was probably meant.
+]]
+function Bitfield.fromName(name: string): Bitfield
+	local bit = (Const.PermissionBits :: { [string]: number })[name]
+	if bit == nil then
+		local guess = Spec.suggest(name, PERMISSION_NAMES)
+		local hint = if guess ~= nil then `; did you mean "{guess}"?` else ""
+		error(`unknown permission "{name}"{hint}`, blame())
+	end
+	return Bitfield.fromBit(bit)
+end
+
+--[[
+	Accepts whichever representation turned up: a field, a number, the
+	decimal string Discord sends, or a permission name. A string of digits
+	is always a mask, never a name -- no permission name is numeric.
+]]
 function Bitfield.coerce(value: string | number | Bitfield): Bitfield
 	if type(value) == "string" then
+		if string.find(value, "^%d*$") == nil then
+			return Bitfield.fromName(value)
+		end
 		return Bitfield.fromString(value)
 	elseif type(value) == "number" then
 		return Bitfield.fromNumber(value)
@@ -78,7 +117,8 @@ function Bitfield.coerce(value: string | number | Bitfield): Bitfield
 	return value
 end
 
---- Combines any mix of bit positions, decimal strings, numbers and fields.
+--- Combines any mix of permission names, decimal-string masks, number masks
+--- and fields. Numbers are masks, not bit positions; use `fromBit` for those.
 function Bitfield.of(...: string | number | Bitfield): Bitfield
 	local hi, lo = 0, 0
 	for index = 1, select("#", ...) do

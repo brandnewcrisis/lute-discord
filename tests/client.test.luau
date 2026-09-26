@@ -12,6 +12,7 @@
 local task = require("@lute/task")
 
 local Client = require("@discord/client")
+local Commands = require("@discord/commands")
 local Const = require("@discord/const")
 local Log = require("@discord/log")
 local Fakes = require("./fakes")
@@ -869,6 +870,289 @@ do
 	h.check("Client.new without logFile keeps the bot's Log.setFile", string.find(text, "probe after Client.new", 1, true) ~= nil)
 	Client.new({ token = "TOKEN", intents = 0, logLevel = "error" })
 	h.check("an explicit logLevel still applies", not Log.enabled("warn"))
+end
+
+----------------------------------------------------------------------------
+-- Diagnostics capture, for the tests below
+----------------------------------------------------------------------------
+type Line = { level: string, message: string }
+
+--- Lines logged at info and above while `fn` runs.
+local function capture(fn: () -> ()): { Line }
+	local lines: { Line } = {}
+	Log.setHook(function(level: string, message: string)
+		table.insert(lines, { level = level, message = message })
+	end)
+	Log.setLevel("info")
+	fn()
+	Log.setLevel("error")
+	Log.setHook(nil)
+	return lines
+end
+
+local function logged(lines: { Line }, level: string, fragment: string): number
+	local n = 0
+	for _, line in lines do
+		if line.level == level and string.find(line.message, fragment, 1, true) ~= nil then
+			n += 1
+		end
+	end
+	return n
+end
+
+----------------------------------------------------------------------------
+-- Client.new rejects misspelled options
+----------------------------------------------------------------------------
+do
+	h.throws("a misspelled option names the right one", 'Client.new has no option "logLvel"; did you mean "logLevel"?', function()
+		Client.new({ token = "TOKEN", intents = 0, logLvel = "debug" } :: any)
+	end)
+	h.throws("a wire-style name is suggested in camelCase", 'did you mean "shardCount"?', function()
+		Client.new({ token = "TOKEN", intents = 0, shard_count = 2 } :: any)
+	end)
+	h.check("every documented option is accepted", pcall(Client.new, {
+		token = "TOKEN",
+		intents = 0,
+		cache = false,
+		logLevel = "error",
+		shardCount = 1,
+		errorMessage = "x",
+		showErrors = false,
+		http = {},
+		gateway = {},
+	} :: any))
+end
+
+----------------------------------------------------------------------------
+-- register + deploy(): handlers from the builders, routed by path
+----------------------------------------------------------------------------
+do
+	local r = rig()
+	local client = r.client
+	local hits = {}
+	local ping = Commands.slash("ping", "Check I am alive"):handle(function(ix)
+		table.insert(hits, "ping")
+		return ix:reply("pong")
+	end)
+	local role = Commands.slash("role", "Roles")
+		:subcommand("add", "Add a role", function(sub)
+			sub:stringOption("name", "Role name", { autocomplete = true })
+			sub:handle(function()
+				table.insert(hits, "role add")
+			end)
+			sub:onAutocomplete(function(ix)
+				table.insert(hits, "role add (autocomplete)")
+				ix:autocomplete({ { name = "Deputy", value = "deputy" } })
+			end)
+		end)
+		:subcommand("remove", "Remove a role", function(sub)
+			sub:handle(function()
+				table.insert(hits, "role remove")
+			end)
+		end)
+
+	h.throws("deploy() with nothing registered is an error", "client:register", function()
+		client:deploy()
+	end)
+	h.equals("register also takes builders as arguments", #client:register(ping), 1)
+	h.throws("register rejects a plain command table", "not a command builder", function()
+		client:register({ { name = "x", description = "y" } } :: any)
+	end)
+
+	local returned = client:register({ ping, role })
+	h.equals("register returns the list", returned[2], role)
+	client:register({ ping }) -- again: must not duplicate
+	local lines = capture(function()
+		client:deploy(nil, GUILD)
+	end)
+	local body = r.rest:find("PUT", `/applications/{APP}/guilds/{GUILD}/commands`)[1]
+	h.equals("deploy() publishes every registered command, once each", body and #body.json, 2)
+	h.equals("as their payloads", body and body.json[2].options[1].name, "add")
+	h.equals("and a fully wired deploy warns about nothing", logged(lines, "warn", ""), 0)
+
+	client:_dispatch("INTERACTION_CREATE", interaction(2, { name = "ping", type = 1 }))
+	client:_dispatch("INTERACTION_CREATE", interaction(2, {
+		name = "role",
+		type = 1,
+		options = { { type = 1, name = "remove", options = {} } },
+	}))
+	local auto = interaction(4, {
+		name = "role",
+		type = 1,
+		options = { { type = 1, name = "add", options = { { type = 3, name = "name", value = "de", focused = true } } } },
+	})
+	client:_dispatch("INTERACTION_CREATE", auto)
+	settle()
+	h.check("a registered command handler runs", table.find(hits, "ping") ~= nil)
+	h.check("a registered subcommand handler runs by its path", table.find(hits, "role remove") ~= nil)
+	h.check("a registered autocomplete handler runs", table.find(hits, "role add (autocomplete)") ~= nil)
+	h.equals("and answers the autocomplete", callbacks(r, auto)[1] and callbacks(r, auto)[1].type, 8)
+
+	-- An explicit list still wins over the registered set.
+	client:deploy({ { name = "ping", description = "pong", type = 1 } } :: any)
+	local global = r.rest:find("PUT", `/applications/{APP}/commands`)[1]
+	h.equals("an explicit list is deployed as given", global and #global.json, 1)
+end
+
+----------------------------------------------------------------------------
+-- Handlers are keyed by command type
+----------------------------------------------------------------------------
+do
+	local r = rig()
+	local client = r.client
+	local hits = {}
+	client:register({
+		Commands.slash("info", "About something"):handle(function()
+			table.insert(hits, "slash")
+		end),
+		Commands.userCommand("info"):handle(function()
+			table.insert(hits, "user")
+		end),
+	})
+	client:command("Report", function()
+		table.insert(hits, "untyped")
+	end)
+	client:command("Report", function()
+		table.insert(hits, "message-typed")
+	end, Const.CommandType.MESSAGE)
+
+	client:_dispatch("INTERACTION_CREATE", interaction(2, { name = "info", type = Const.CommandType.CHAT_INPUT }))
+	settle()
+	client:_dispatch("INTERACTION_CREATE", interaction(2, { name = "info", type = Const.CommandType.USER, target_id = "1" }))
+	settle()
+	h.equals("/info goes to the slash handler", hits[1], "slash")
+	h.equals("the user command \"info\" goes to its own", hits[2], "user")
+
+	client:_dispatch("INTERACTION_CREATE", interaction(2, { name = "Report", type = Const.CommandType.MESSAGE, target_id = "1" }))
+	settle()
+	h.equals("a handler for the exact type beats an untyped one", hits[3], "message-typed")
+	client:_dispatch("INTERACTION_CREATE", interaction(2, { name = "Report", type = Const.CommandType.USER, target_id = "1" }))
+	settle()
+	h.equals("an untyped handler answers any type without its own", hits[4], "untyped")
+
+	local stray = interaction(2, { name = "info", type = Const.CommandType.MESSAGE, target_id = "1" })
+	client:_dispatch("INTERACTION_CREATE", stray)
+	settle()
+	h.equals("a typed handler does not answer another type", #hits, 4)
+	h.equals("which gets the not-wired-up reply", callbacks(r, stray)[1] and callbacks(r, stray)[1].type, 4)
+end
+
+----------------------------------------------------------------------------
+-- deploy warns about commands without handlers, and handlers without commands
+----------------------------------------------------------------------------
+do
+	local r = rig()
+	local client = r.client
+	-- Builder callbacks inside a table-literal argument are annotated:
+	-- there, Luau 1.0.0 does not infer their parameter.
+	client:register({
+		Commands.slash("role", "Roles")
+			:subcommand("add", "Add", function(sub: Commands.Command)
+				sub:handle(function() end)
+			end)
+			:subcommand("remove", "Remove"),
+	})
+	client:command("pign", function() end)
+	client:command("config", function() end)
+	client:autocomplete("wether", function() end)
+	local lines = capture(function()
+		client:deploy({
+			Commands.slash("role", "Roles"):subcommand("add", "Add"):subcommand("remove", "Remove"),
+			Commands.slash("ping", "Ping"),
+			Commands.slash("weather", "Weather"),
+			Commands.slash("config", "Config"):group("roles", "Roles", function(group: Commands.Command)
+				group:subcommand("set", "Set")
+			end),
+			Commands.messageCommand("Quote this"),
+		})
+	end)
+	h.equals(
+		"a deployed subcommand with no handler is named",
+		logged(lines, "warn", '/role remove is deployed but has no handler; users will see "not wired up"'),
+		1
+	)
+	h.equals("a handled one is not", logged(lines, "warn", "/role add is deployed"), 0)
+	h.equals("a context menu reads as one", logged(lines, "warn", 'message command "Quote this" is deployed but has no handler'), 1)
+	h.equals("a bare-name handler covers its subcommands", logged(lines, "warn", "/config roles set is deployed"), 0)
+	h.equals(
+		"a handler for a command never deployed is flagged, with a guess",
+		logged(lines, "warn", "handler for /pign is registered but no such command was deployed; typo? (did you mean /ping?)"),
+		1
+	)
+	h.equals(
+		"autocomplete handlers too",
+		logged(lines, "warn", "autocomplete handler for /wether is registered but no such command was deployed"),
+		1
+	)
+	h.equals("/ping itself is still reported as unhandled", logged(lines, "warn", "/ping is deployed but has no handler"), 1)
+
+	local again = capture(function()
+		client:deploy({ Commands.slash("ping", "Ping") }, GUILD)
+	end)
+	h.equals("each mismatch is reported once per client", logged(again, "warn", "/ping is deployed"), 0)
+	h.equals("and handlers matched by any earlier deploy stay matched", logged(again, "warn", "handler for /config"), 0)
+end
+
+----------------------------------------------------------------------------
+-- showErrors: the error's first line in the notice, for development
+----------------------------------------------------------------------------
+do
+	local r = rig({ showErrors = true })
+	local client = r.client
+	client:command("boom", function()
+		error("the widget is missing")
+	end)
+	client:command("long", function()
+		error(string.rep("x", 3000))
+	end)
+	client:autocomplete("boom", function()
+		error("autocomplete broke")
+	end)
+
+	local boom = interaction(2, { name = "boom", type = 1 })
+	client:_dispatch("INTERACTION_CREATE", boom)
+	settle()
+	local notice = callbacks(r, boom)[1]
+	local content: string = notice and notice.data.content or ""
+	h.check("the notice keeps its text", string.find(content, "Something went wrong running that.", 1, true) == 1)
+	h.check("and adds the error message", string.find(content, "the widget is missing", 1, true) ~= nil)
+	h.check("but not the traceback", string.find(content, "client.luau", 1, true) == nil and select(2, string.gsub(content, "\n", "")) == 3)
+
+	local long = interaction(2, { name = "long", type = 1 })
+	client:_dispatch("INTERACTION_CREATE", long)
+	settle()
+	local longNotice = callbacks(r, long)[1]
+	local longContent: string = longNotice and longNotice.data.content or ""
+	h.check(`a long error is truncated ({#longContent} chars)`, #longContent > 1500 and #longContent < 1700)
+
+	local auto = interaction(4, { name = "boom", type = 1, options = { { type = 3, name = "q", value = "a", focused = true } } })
+	client:_dispatch("INTERACTION_CREATE", auto)
+	settle()
+	h.equals("autocomplete never gets an error notice", #callbacks(r, auto), 0)
+
+	local quiet = rig()
+	quiet.client:command("boom", function()
+		error("the widget is missing")
+	end)
+	local off = interaction(2, { name = "boom", type = 1 })
+	quiet.client:_dispatch("INTERACTION_CREATE", off)
+	settle()
+	local offNotice = callbacks(quiet, off)[1]
+	h.equals("off by default", offNotice and offNotice.data.content, "Something went wrong running that.")
+end
+
+-- Builders handed straight to deploy bring their handlers with them.
+do
+	local r = rig()
+	local handled = Commands.slash("direct", "Deployed without register"):handle(function(_ix) end)
+	local lines = capture(function()
+		r.client:deploy({ handled })
+	end)
+	h.equals(
+		"deploy(list) routes the handlers its builders carry",
+		logged(lines, "warn", "/direct is deployed but has no handler"),
+		0
+	)
 end
 
 h.finish()

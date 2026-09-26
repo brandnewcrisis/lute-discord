@@ -21,27 +21,34 @@ local client = Discord.Client.new({
 	intents = { "guilds" },
 })
 
-client:on("ready", function(ready: Discord.Ready)
+-- Listener parameters are typed from the event name: `ready` is a Ready.
+client:on("ready", function(ready)
 	print(`logged in as {ready.user.username}`)
 end)
 
-client:command("hello", function(ix: Discord.Interaction)
-	local name = ix:opt("name", ix.user.global_name or ix.user.username)
-	ix:reply({
-		content = `Hello, {Discord.Util.escapeMarkdown(name)}!`,
-		components = {
-			Components.row(Components.button({ id = "wave", label = "Wave back", emoji = "👋" })),
-		},
-	})
-end)
+-- The command's schema and its handler live together, so renaming an
+-- option can't leave the handler reading one that no longer exists.
+client:register(Commands.slash("hello", "Say hello")
+	:stringOption("name", "Who to greet")
+	:handle(function(ix)
+		local name = ix:getString("name") or ix.user.global_name or ix.user.username
+		ix:reply({
+			content = `Hello, {Discord.Util.escapeMarkdown(name)}!`,
+			components = {
+				Components.row(Components.button({ id = "wave", label = "Wave back", emoji = "👋" })),
+			},
+		})
+	end))
 
 -- Matches any button whose custom_id starts with "wave".
-client:component("wave", function(ix: Discord.Interaction)
+client:component("wave", function(ix)
 	ix:replyEphemeral(`{ix.user.username} waved back.`)
 end)
 
-client:deploy({
-	Commands.slash("hello", "Say hello"):stringOption("name", "Who to greet"),
-}, env:get("DISCORD_GUILD_ID"))
+-- Publishes everything registered above.
+client:deploy(nil, env:get("DISCORD_GUILD_ID"))
 
-client:run()
+-- Inside Discord.main so a bad token or a missing intent exits non-zero.
+Discord.main(function()
+	client:run()
+end)

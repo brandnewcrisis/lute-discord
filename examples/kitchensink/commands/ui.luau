@@ -263,8 +263,10 @@ function Ui.register(client: Discord.Client, _ctx: Ctx.Ctx)
 
 		-- `await` turns the callback dance into three readable lines. The
 		-- handler is already on its own task, so blocking here blocks
-		-- nothing else.
-		local collector = client:collect({ userId = ix.user.id, timeout = 30, max = 1 })
+		-- nothing else. Scoped to this message: a collector keyed only on
+		-- the user would take every button they pressed anywhere for 30s.
+		local prompt = ix:fetchReply()
+		local collector = client:collect({ messageId = prompt.id, userId = ix.user.id, timeout = 30, max = 1 })
 		local answer = collector:await()
 
 		if answer == nil then

@@ -24,13 +24,37 @@ local client = Discord.Client.new({
 	intents = { "guilds" },
 })
 
-client:command("ping", function(ix: Discord.Interaction)
+client:register(Discord.Commands.slash("ping", "Check the bot is alive"):handle(function(ix)
 	ix:reply(`pong ({math.floor(client:latency() * 1000)} ms)`)
-end)
+end))
 
-client:deploy({ Discord.Commands.slash("ping", "Check the bot is alive") }, env:get("DISCORD_GUILD_ID"))
-client:run()
+client:deploy(nil, env:get("DISCORD_GUILD_ID"))
+Discord.main(function()
+	client:run()
+end)
 ```
+
+## Built to be hard to misuse
+
+Most of the time a Discord bot goes wrong silently: a handler that never
+fires, an option that's quietly ignored, a 400 that doesn't say which field
+was wrong. This library tries to turn each of those into a message on the
+line that caused it:
+
+- **Typed events.** `client:on("messageCreate", function(m) ... end)` knows
+  `m` is a Message, and autocompletes it.
+- **Intent warnings.** Listening for `guildMemberAdd` without the
+  `guildMembers` intent logs that the handler will never fire, and why.
+- **Typo checks.** A misspelled event name or option key is caught, with a
+  suggestion: `min_value` gets "did you mean `min`?".
+- **Commands and handlers together.** `Commands.slash(...):handle(fn)` keeps
+  the schema next to the code that answers it. After deploying, the client
+  warns about commands without a handler, and handlers without a command.
+- **Validation where you made the mistake.** Builders check Discord's limits
+  when you call them, and errors point at your line, not the library's.
+- **Readable failures.** A bad token prints the 401 and how to fix it, not
+  an empty stack trace. `showErrors = true` shows handler errors in Discord
+  while you develop.
 
 ## What it covers
 
@@ -58,7 +82,18 @@ repository plus an alias.
 git submodule add https://github.com/brandnewcrisis/lute-discord.git vendor/lute-discord
 ```
 
-Then point a `.luaurc` alias at `src/`. The alias must be called `discord`,
+The fastest start is the scaffold. It writes a working bot project around
+the library (toolchain pin, `.luaurc`, `.env.example`, a `main.luau`, and one
+command), and never overwrites files you already have:
+
+```bash
+cd vendor/lute-discord && rokit install && lute run tools/new.luau ../.. && cd ../..
+```
+
+It runs from inside the library because rokit needs a toolchain manifest to
+find `lute`, and your project doesn't have one until the scaffold writes it.
+
+To set it up by hand instead, point a `.luaurc` alias at `src/`. The alias must be called `discord`,
 because the library's modules require each other as `@discord/...`:
 
 ```json
@@ -136,7 +171,7 @@ Each command demonstrates one specific thing:
 rokit install
 lute run tools/check.luau              # typecheck every file
 lute lint src examples tests tools
-lute run tests/run.luau                # 24 suites, about 1,600 checks, about 15 seconds
+lute run tests/run.luau                # 27 suites, about 1,800 checks, under 20 seconds
 ```
 
 The tests run offline. The network layer is driven through a scripted REST

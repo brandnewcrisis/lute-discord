@@ -52,43 +52,69 @@ the consent screen, so your code should never assume it got them all. See
 Open the link, pick your test server, and authorise. The bot appears in the
 member list, offline until your code logs in.
 
-## 2. Install lute-discord
+## 2. Create the project
 
 The library isn't in a package registry. You install it by putting a copy of
-the repository inside your project, then pointing a `.luaurc` alias at its
-`src/` folder. A git submodule is the simplest way to do that, and it pins
-the exact version you tested against:
+the repository inside your project. A git submodule is the simplest way to
+do that, and it pins the exact version you tested against. Then the
+scaffold writes the rest of the project for you:
 
 ```bash
 mkdir my-bot && cd my-bot
 git init
 git submodule add https://github.com/brandnewcrisis/lute-discord.git vendor/lute-discord
+cd vendor/lute-discord
+rokit install
+lute run tools/new.luau ../..
+cd ../..
 ```
 
-Create `.luaurc` in your project root:
+The scaffold runs from inside the library because that's where a toolchain
+manifest already exists: rokit only runs tools listed in a manifest it can
+find, and your project doesn't have one until the scaffold writes it.
+`rokit install` fetches the pinned Lute the first time. The `../..` is the
+path back to your project. If you have Lute on your `PATH` some other way,
+`lute run vendor/lute-discord/tools/new.luau .` from the project root does
+the same.
 
-```json
-{ "languageMode": "strict", "aliases": { "discord": "./vendor/lute-discord/src" } }
+It lists what it wrote:
+
+```text
+project: /home/you/my-bot
+library: ./vendor/lute-discord/src
+  wrote   rokit.toml
+  wrote   .luaurc
+  wrote   .gitignore
+  wrote   .env.example
+  wrote   main.luau
+  wrote   commands/init.luau
+  wrote   commands/ping.luau
 ```
 
-The alias must be named `discord`. The library's own modules require each
-other as `@discord/...`, so any other name breaks those requires.
+| File | What it's for |
+| --- | --- |
+| `rokit.toml` | Pins Lute 1.0.0, the version the library is tested against. |
+| `.luaurc` | Strict mode, a `discord` alias pointing at the library's `src/`, and a `bot` alias for your project root. |
+| `.gitignore` | Keeps `.env`, `*.log` and `data/` out of git. |
+| `.env.example` | The variables the bot reads, with a comment on each. |
+| `main.luau` | Creates the client, registers the commands, publishes them, and connects. |
+| `commands/init.luau` | The list of every command the bot has. |
+| `commands/ping.luau` | One command, `/ping`. |
 
-Pin the toolchain with a `rokit.toml` of your own, next to `.luaurc`:
+It never overwrites a file. One that already exists is listed as `kept` and
+left alone, so running it in a half-set-up project fills in only what's
+missing.
 
-```toml
-[tools]
-lute = "luau-lang/lute@1.0.0"
-```
-
-Then install it:
+Now install the pinned toolchain:
 
 ```bash
 rokit install
 ```
 
-rokit only runs tools listed in a manifest it can find, so this file is
-needed even though the library ships one of its own.
+The `discord` alias is computed from where the library sits, so it's right
+even if you put the submodule somewhere other than `vendor/`. Whatever the
+path, the alias must be named `discord`: the library's own modules require
+each other as `@discord/...`, so any other name breaks those requires.
 
 Two things to know about submodules. Anyone who clones your bot needs
 `git clone --recurse-submodules` (or `git submodule update --init` after a
@@ -96,20 +122,41 @@ plain clone), otherwise `vendor/lute-discord` is empty. And you upgrade on
 purpose, with `git submodule update --remote vendor/lute-discord`, then commit
 the new pointer.
 
+### Setting up by hand
+
+The scaffold only writes files, so you can do the same yourself. Create
+`.luaurc` in your project root:
+
+```json
+{ "languageMode": "strict", "aliases": { "discord": "./vendor/lute-discord/src", "bot": "." } }
+```
+
+and a `rokit.toml` next to it, then run `rokit install`:
+
+```toml
+[tools]
+lute = "luau-lang/lute@1.0.0"
+```
+
+rokit needs this file even though the library ships one of its own. For the
+bot itself, `examples/minimal/main.luau` in the library is a complete bot in
+one file, and the steps below explain each piece of it.
+
 ## 3. Keep the token out of your code
 
-Create a `.env` file in the project root:
+Copy the example environment file and fill it in:
+
+```bash
+cp .env.example .env
+```
 
 ```bash
 DISCORD_TOKEN=paste-the-token-here
 DISCORD_GUILD_ID=your-test-server-id
 ```
 
-and make sure git never sees it:
-
-```bash
-echo ".env" >> .gitignore
-```
+The scaffold's `.gitignore` already keeps `.env` out of git. (Set up by
+hand? Run `echo ".env" >> .gitignore` before you create it.)
 
 `Discord.Env.load()` reads this file. Real environment variables win over
 it, so the same code runs on your laptop with a `.env` and in production with
@@ -120,73 +167,137 @@ Advanced**), then right-click your server's icon and pick **Copy Server ID**.
 Developer Mode also adds **Copy ID** to users, channels and messages, which
 you'll want constantly.
 
-## 4. Write the bot
+## 4. Read the bot
 
-This is `examples/minimal/main.luau` from the library, built up one piece at a
-time. Put the pieces in `main.luau` in your project root.
+This is the `main.luau` the scaffold wrote:
 
-Start with strict mode, the library, and the configuration:
+```luau
+--!strict
+-- Starts the bot: lute run main.luau
+local Discord = require("@discord")
+
+local commands = require("@bot/commands")
+
+local env = Discord.Env.load()
+
+local client = Discord.Client.new({
+	token = env:require("DISCORD_TOKEN"),
+	-- Slash commands and buttons arrive whatever intents you ask for; add
+	-- more (e.g. "guildMessages") when you listen for gateway events.
+	intents = { "guilds" },
+	logLevel = env:get("LOG_LEVEL", "info"),
+	-- Shows the error text to the user when a handler throws. Handy while
+	-- developing; turn it off before inviting the bot anywhere real.
+	showErrors = true,
+})
+
+client:on("ready", function(ready)
+	print(`logged in as {ready.user.username}`)
+end)
+
+client:register(commands)
+-- With DISCORD_GUILD_ID set, commands go to that server only, instantly.
+client:deploy(nil, env:get("DISCORD_GUILD_ID"))
+
+-- Inside Discord.main so a bad token or a missing intent exits with a
+-- non-zero status and a readable message.
+Discord.main(function()
+	client:run()
+end)
+```
+
+Piece by piece:
+
+- `require("@discord")` gives you one table holding every module
+  (`Discord.Commands`, `Discord.Components`, `Discord.Embed` and so on). It
+  also works as a type namespace: `Discord.Interaction`, `Discord.Message`
+  and the other common types come with it, so you rarely need a second
+  require. `@bot/commands` is your own `commands/init.luau`.
+- `env:require` throws with the variable's name if it's missing or empty,
+  which beats a confusing 401 from Discord later.
+- `intents` says which gateway events Discord should send you. Slash
+  commands and button clicks arrive whatever you ask for, so `guilds` is
+  plenty here. [events.md](events.md#intents) covers the rest.
+- `showErrors = true` puts the first line of an error in the message the
+  user sees when a handler throws, so you see what broke without reading
+  the log. Turn it off before the bot is anywhere public
+  ([interactions.md](interactions.md#when-a-handler-throws) says why).
+  `Client.new` checks its option names, so a misspelled one
+  (`showError`) fails with the name you meant instead of being ignored.
+- `client:on("ready", ...)` runs once the bot is connected. The listener's
+  parameter is typed from the event name, so `ready` is a `Discord.Ready`
+  without an annotation.
+- `client:register(commands)` routes the handlers attached to each command.
+  `client:deploy` uploads the command definitions to Discord, which is what
+  makes them appear in the `/` menu. With no list it publishes everything
+  registered. The second argument is a server ID, which makes the commands
+  appear in that server straight away (see below). After deploying, it
+  warns about any command without a handler, and any handler without a
+  command.
+- `client:run` connects and blocks for as long as the bot runs. If the bot
+  can't stay connected (a wrong token, say), it raises an error with the
+  reason, and `Discord.main` logs it and exits with status 1.
+  [deploying.md](deploying.md#clientrun-and-clientlogin) covers running
+  unattended.
+
+The command itself is in `commands/ping.luau`:
 
 ```luau
 --!strict
 local Discord = require("@discord")
-local Commands = Discord.Commands
+
+return Discord.Commands.slash("ping", "Check the bot is alive"):handle(function(ix: Discord.Interaction)
+	ix:reply("pong")
+end)
+```
+
+`Commands.slash` defines the command, and `:handle` attaches the function
+that answers it, so the definition and its handler live together. `ix` is
+the [interaction](interactions.md): one user running one command.
+`ix:reply` answers. `commands/init.luau` lists every command file, and
+`main.luau` registers that list.
+
+## 5. Add a command
+
+Add a `/hello` command with a button. Create `commands/hello.luau`:
+
+```luau
+--!strict
+local Discord = require("@discord")
 local Components = Discord.Components
 
-local env = Discord.Env.load()
+return Discord.Commands.slash("hello", "Say hello")
+	:stringOption("name", "Who to greet")
+	:handle(function(ix)
+		local name = ix:getString("name") or ix.user.global_name or ix.user.username
+		ix:reply({
+			content = `Hello, {Discord.Util.escapeMarkdown(name)}!`,
+			components = {
+				Components.row(Components.button({ id = "wave", label = "Wave back", emoji = "\u{1f44b}" })),
+			},
+		})
+	end)
 ```
 
-`require("@discord")` gives you one table holding every module
-(`Discord.Commands`, `Discord.Components`, `Discord.Embed` and so on). It
-also works as a type namespace: `Discord.Interaction`, `Discord.Message` and
-the other common types come with it, so you rarely need a second require.
+`ix:getString("name")` reads the option, or returns nil when the user left
+it out. It also checks that `name` really is a string option, so the
+definition and the handler can't quietly disagree. `ix:reply` answers, and
+here it attaches a button. `escapeMarkdown` stops a name like `**x**` from
+turning bold.
 
-Create the client:
+Add it to the list in `commands/init.luau`:
 
 ```luau
-local client = Discord.Client.new({
-	token = env:require("DISCORD_TOKEN"),
-	intents = { "guilds" },
-})
+local commands: { Discord.Command } = {
+	require("@bot/commands/ping"),
+	require("@bot/commands/hello"),
+}
 ```
 
-`env:require` throws with the variable's name if it's missing or empty, which
-beats a confusing 401 from Discord later. `intents` says which gateway events
-Discord should send you. Slash commands and button clicks arrive whatever you
-ask for, so `guilds` is plenty here. [events.md](events.md#intents) covers the
-rest.
-
-Listen for the moment the bot is connected:
+Then handle the button in `main.luau`, before `client:deploy`:
 
 ```luau
-client:on("ready", function(ready: Discord.Ready)
-	print(`logged in as {ready.user.username}`)
-end)
-```
-
-Handle a slash command:
-
-```luau
-client:command("hello", function(ix: Discord.Interaction)
-	local name = ix:opt("name", ix.user.global_name or ix.user.username)
-	ix:reply({
-		content = `Hello, {Discord.Util.escapeMarkdown(name)}!`,
-		components = {
-			Components.row(Components.button({ id = "wave", label = "Wave back", emoji = "\u{1f44b}" })),
-		},
-	})
-end)
-```
-
-`ix` is the [interaction](interactions.md): one user running one command.
-`ix:opt("name", default)` reads an option, falling back to the default when
-the user didn't fill it in. `ix:reply` answers, and here it attaches a button.
-`escapeMarkdown` stops a name like `**x**` from turning bold.
-
-Handle the button:
-
-```luau
-client:component("wave", function(ix: Discord.Interaction)
+client:component("wave", function(ix)
 	ix:replyEphemeral(`{ix.user.username} waved back.`)
 end)
 ```
@@ -195,78 +306,20 @@ A button carries a `custom_id` (the `id` you gave it), and `client:component`
 routes by prefix of that id. `replyEphemeral` sends a reply that only the
 person who clicked can see.
 
-Publish the command and connect:
-
-```luau
-client:deploy({
-	Commands.slash("hello", "Say hello"):stringOption("name", "Who to greet"),
-}, env:get("DISCORD_GUILD_ID"))
-
-client:run()
-```
-
-Registering a handler with `client:command` doesn't tell Discord the command
-exists. `client:deploy` does that: it uploads the command definitions. The
-second argument is a server ID, which makes the command appear in that server
-straight away (see below). `client:run` connects and blocks for as long as
-the bot runs. If the bot can't stay connected (a wrong token, say), it
-raises an error with the reason. [deploying.md](deploying.md#clientrun-and-clientlogin)
-covers handling that when the bot runs unattended.
-
-Here is the whole file:
-
-```luau
---!strict
-local Discord = require("@discord")
-local Commands = Discord.Commands
-local Components = Discord.Components
-
-local env = Discord.Env.load()
-
-local client = Discord.Client.new({
-	token = env:require("DISCORD_TOKEN"),
-	intents = { "guilds" },
-})
-
-client:on("ready", function(ready: Discord.Ready)
-	print(`logged in as {ready.user.username}`)
-end)
-
-client:command("hello", function(ix: Discord.Interaction)
-	local name = ix:opt("name", ix.user.global_name or ix.user.username)
-	ix:reply({
-		content = `Hello, {Discord.Util.escapeMarkdown(name)}!`,
-		components = {
-			Components.row(Components.button({ id = "wave", label = "Wave back", emoji = "\u{1f44b}" })),
-		},
-	})
-end)
-
-client:component("wave", function(ix: Discord.Interaction)
-	ix:replyEphemeral(`{ix.user.username} waved back.`)
-end)
-
-client:deploy({
-	Commands.slash("hello", "Say hello"):stringOption("name", "Who to greet"),
-}, env:get("DISCORD_GUILD_ID"))
-
-client:run()
-```
-
-## 5. Run it
+## 6. Run it
 
 ```bash
-lute check main.luau   # optional: typecheck first
+lute check main.luau commands/*.luau   # optional: typecheck first
 lute run main.luau
 ```
 
 The log should look roughly like this:
 
 ```text
-12:00:01 INFO   deployed 1 command(s) to guild 123456789012345678
-12:00:01 INFO   gateway: 1 shard(s), 999/1000 session starts left, max concurrency 1
-12:00:01 INFO   shard 0: identifying
-12:00:02 INFO   [MyBot] shard 0: ready as MyBot in 1 guild(s)
+2026-09-26 12:00:01 INFO	deployed 2 command(s) to guild 123456789012345678
+2026-09-26 12:00:01 INFO	gateway: 1 shard(s), 999/1000 session starts left, max concurrency 1
+2026-09-26 12:00:01 INFO	shard 0: identifying
+2026-09-26 12:00:02 INFO	[MyBot] shard 0: ready as MyBot in 1 guild(s)
 logged in as MyBot
 ```
 
@@ -279,7 +332,8 @@ If it doesn't work, the log says why:
 | --- | --- |
 | `DISCORD_TOKEN is not set in ...` | The `.env` file is missing, not in the directory you ran from, or the line is empty. |
 | `Discord 401 ...` and `the bot token is invalid or has been reset` | The token is wrong, or you reset it after copying. Copy a fresh one. |
-| `/hello` doesn't appear | The bot was invited without `applications.commands`, or `DISCORD_GUILD_ID` is unset and you're waiting on a global deploy. Discord's client also caches the command list: press Ctrl+R to reload it. |
+| `/hello is deployed but has no handler` | The builder in `commands/hello.luau` has no `:handle`. |
+| `/hello` doesn't appear | `commands/hello.luau` isn't in the list in `commands/init.luau`, the bot was invited without `applications.commands`, or `DISCORD_GUILD_ID` is unset and you're waiting on a global deploy. Discord's client also caches the command list: press Ctrl+R to reload it. |
 | "The application did not respond" | The bot isn't running, or a handler took longer than three seconds. See [interactions.md](interactions.md#the-three-second-rule). |
 
 [troubleshooting.md](troubleshooting.md) has the full list.

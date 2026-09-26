@@ -114,4 +114,43 @@ local anywhere = Commands.slash("x", "y"):userInstallable():toJSON()
 h.equals("user-installable commands allow private channels", #h.some(anywhere.contexts), 3)
 h.equals("guildOnly(false) stays within guild-install contexts", #h.some(Commands.slash("x", "y"):guildOnly(false):toJSON().contexts), 2)
 
+-- Typos in option tables fail loudly instead of being ignored.
+h.throws("Discord's min_value spelling points at min", 'did you mean "min"', function()
+	Commands.slash("x", "y"):integerOption("n", "n", { min_value = 2 } :: any)
+end)
+h.throws("a misspelled key in a full spec is named", 'no option "requried"', function()
+	Commands.slash("x", "y"):option({ name = "a", description = "a", type = "string", requried = true } :: any)
+end)
+
+-- Handlers ride along with the schema.
+local function noop(_ix: any) end
+local role = Commands.slash("role", "Manage roles")
+	:subcommand("add", "Give a role", function(sub)
+		sub:userOption("user", "Who", { required = true }):handle(noop)
+	end)
+	:subcommand("remove", "Take a role", function(sub)
+		sub:handle(noop):onAutocomplete(noop)
+	end)
+local entries = Commands.handlers(role)
+h.equals("one entry per handled subcommand", #entries, 2)
+h.equals("paths are full", entries[1].path, "role add")
+h.check("autocomplete is carried", entries[2].autocomplete ~= nil and entries[2].path == "role remove")
+h.equals("the type is the top-level command's", entries[1].type, Const.CommandType.CHAT_INPUT)
+h.check("handlers never reach the payload", (role:toJSON() :: any)._run == nil and h.some(role:toJSON().options)[1].handle == nil)
+
+local grouped2 = Commands.slash("config", "Configure"):group("roles", "Role settings", function(group)
+	group:subcommand("add", "Add", function(sub)
+		sub:handle(noop)
+	end)
+end)
+h.equals("group paths have three parts", Commands.handlers(grouped2)[1].path, "config roles add")
+local menu2 = Commands.userCommand("Who is this"):handle(noop)
+h.equals("context menus carry their type", Commands.handlers(menu2)[1].type, Const.CommandType.USER)
+
+h.throws("a group cannot carry a handler", "cannot have a handler", function()
+	Commands.slash("config2", "Configure"):group("roles", "Role settings", function(group)
+		group:handle(noop)
+	end)
+end)
+
 h.finish()

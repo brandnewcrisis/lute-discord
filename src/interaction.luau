@@ -22,6 +22,7 @@
 local blame = require("@discord/blame")
 local Api = require("@discord/api")
 local Bitfield = require("@discord/bitfield")
+local Cache = require("@discord/cache")
 local Const = require("@discord/const")
 local Log = require("@discord/log")
 local Payload = require("@discord/payload")
@@ -35,10 +36,18 @@ Interaction.__index = Interaction
 	The part of the client an interaction needs, named structurally.
 
 	`@discord/client` requires this module, so this module cannot require it
-	back. All an interaction ever reaches for is the endpoint surface, so
-	that is all this asks for -- and a real `Client` satisfies it.
+	back. What a handler reaches for through `ix.client` is the endpoint
+	surface, the cache and the bot's own user, so those are named here --
+	which lets a handler living in its own file use `ix.client.cache`
+	instead of closing over the client. `@discord/cache` requires only the
+	types, so naming it here is no cycle. A real `Client` satisfies this.
 ]]
-export type ClientRef = { api: Api.Api }
+export type ClientRef = {
+	api: Api.Api,
+	cache: Cache.Cache,
+	--- The bot's own user; nil until READY.
+	user: Types.User?,
+}
 
 export type Interaction = typeof(setmetatable(
 	{} :: {
@@ -207,6 +216,140 @@ function Interaction.getAttachment(self: Interaction, name: string): Types.Attac
 	return (resolved(self).attachments or {})[id]
 end
 
+--[[
+	Typed option reads.
+
+	`opt` is `any` because the schema that fixes an option's type is out of
+	Luau's sight (see `options`). These take the type the handler expects,
+	check it against the `type` Discord sends with every option, and say so
+	when the two disagree -- which happens when the schema is edited and the
+	handler is not, and otherwise surfaces as a comparison that is always
+	false. Nil means the option was not supplied.
+]]
+local OPTION_TYPE_NAMES: { [number]: string } = {
+	[Const.OptionType.SUB_COMMAND] = "subcommand",
+	[Const.OptionType.SUB_COMMAND_GROUP] = "subcommand group",
+	[Const.OptionType.STRING] = "string",
+	[Const.OptionType.INTEGER] = "integer",
+	[Const.OptionType.BOOLEAN] = "boolean",
+	[Const.OptionType.USER] = "user",
+	[Const.OptionType.CHANNEL] = "channel",
+	[Const.OptionType.ROLE] = "role",
+	[Const.OptionType.MENTIONABLE] = "mentionable",
+	[Const.OptionType.NUMBER] = "number",
+	[Const.OptionType.ATTACHMENT] = "attachment",
+}
+
+local function typeName(kind: number): string
+	return OPTION_TYPE_NAMES[kind] or `type {kind}`
+end
+
+-- Not "u": the only kind starting with it is "user", which takes "a".
+local function article(word: string): string
+	return if string.find(word, "^[aeio]") ~= nil then `an {word}` else `a {word}`
+end
+
+local function findOption(self: Interaction, name: string): Types.CommandOption?
+	for _, option in leafOptions(self) do
+		if option.name == name then
+			return option
+		end
+	end
+	return nil
+end
+
+--- The option, if supplied, after checking it is one of `kinds`. `wanted`
+--- names the expected kind in the error.
+local function typedOption(self: Interaction, name: string, wanted: string, kinds: { number }): Types.CommandOption?
+	local option = findOption(self, name)
+	if option == nil or option.value == nil then
+		return nil
+	end
+	if table.find(kinds, option.type) == nil then
+		error(`option "{name}" is {article(typeName(option.type))}, not {article(wanted)}`, blame())
+	end
+	return option
+end
+
+--[[
+	A numeric option's value. On an autocomplete interaction the FOCUSED
+	option carries the raw text typed so far even when the option is numeric,
+	so a string is parsed -- nil while it is not yet a number ("", "-").
+]]
+local function numeric(option: Types.CommandOption?): number?
+	if option == nil then
+		return nil
+	end
+	local value = option.value
+	if type(value) == "string" then
+		return tonumber(value)
+	end
+	return if type(value) == "number" then value else nil
+end
+
+local STRING_KINDS = { Const.OptionType.STRING }
+local INTEGER_KINDS = { Const.OptionType.INTEGER }
+-- An integer option is a number too; asking for a number from one is not a
+-- mistake worth an error.
+local NUMBER_KINDS = { Const.OptionType.NUMBER, Const.OptionType.INTEGER }
+local BOOLEAN_KINDS = { Const.OptionType.BOOLEAN }
+local MENTIONABLE_KINDS = { Const.OptionType.MENTIONABLE, Const.OptionType.USER, Const.OptionType.ROLE }
+
+function Interaction.getString(self: Interaction, name: string): string?
+	local option = typedOption(self, name, "string", STRING_KINDS)
+	return if option ~= nil then option.value :: string else nil
+end
+
+function Interaction.getInteger(self: Interaction, name: string): number?
+	return numeric(typedOption(self, name, "integer", INTEGER_KINDS))
+end
+
+function Interaction.getNumber(self: Interaction, name: string): number?
+	return numeric(typedOption(self, name, "number", NUMBER_KINDS))
+end
+
+function Interaction.getBoolean(self: Interaction, name: string): boolean?
+	local option = typedOption(self, name, "boolean", BOOLEAN_KINDS)
+	return if option ~= nil then option.value == true else nil
+end
+
+--[[
+	What a mentionable option named: a user or a role.
+
+	A tagged record rather than `User | Role`. Those two are both open
+	tables of strings, so a bare union can only be told apart by probing for
+	a field one of them happens to lack -- and every caller would repeat the
+	probe. Here `kind` does it once, and checking it narrows the rest:
+	`if m.kind == "user" then m.user.username`. `member` is present for a
+	user who is in the server, with `user` spliced back in as `getMember`
+	does.
+]]
+export type Mentionable =
+	{ kind: "user", id: string, user: Types.User, member: Types.Member? }
+	| { kind: "role", id: string, role: Types.Role }
+
+function Interaction.getMentionable(self: Interaction, name: string): Mentionable?
+	local option = typedOption(self, name, "mentionable", MENTIONABLE_KINDS)
+	if option == nil then
+		return nil
+	end
+	local id = tostring(option.value)
+	local data = resolved(self)
+	local user = (data.users or {})[id]
+	if user ~= nil then
+		local member = (data.members or {})[id]
+		if member ~= nil and member.user == nil then
+			member.user = user
+		end
+		return { kind = "user", id = id, user = user, member = member }
+	end
+	local role = (data.roles or {})[id]
+	if role ~= nil then
+		return { kind = "role", id = id, role = role }
+	end
+	return nil
+end
+
 --- The option the user is currently typing, on an autocomplete interaction.
 --- Returns its name and its value so far; the value is `any` for the reason
 --- given on `options`.
@@ -307,6 +450,49 @@ function Interaction.requireAttachment(self: Interaction, name: string): Types.A
 		error(`option "{name}" was supplied but Discord sent no resolved attachment for it`, blame())
 	end
 	return attachment
+end
+
+function Interaction.requireString(self: Interaction, name: string): string
+	local value = Interaction.getString(self, name)
+	if value == nil then
+		error(missing(name), blame())
+	end
+	return value
+end
+
+function Interaction.requireInteger(self: Interaction, name: string): number
+	local value = Interaction.getInteger(self, name)
+	if value == nil then
+		error(missing(name), blame())
+	end
+	return value
+end
+
+function Interaction.requireNumber(self: Interaction, name: string): number
+	local value = Interaction.getNumber(self, name)
+	if value == nil then
+		error(missing(name), blame())
+	end
+	return value
+end
+
+function Interaction.requireBoolean(self: Interaction, name: string): boolean
+	local value = Interaction.getBoolean(self, name)
+	if value == nil then
+		error(missing(name), blame())
+	end
+	return value
+end
+
+function Interaction.requireMentionable(self: Interaction, name: string): Mentionable
+	if Interaction.opt(self, name) == nil then
+		error(missing(name), blame())
+	end
+	local value = Interaction.getMentionable(self, name)
+	if value == nil then
+		error(`option "{name}" was supplied but Discord sent no resolved user or role for it`, blame())
+	end
+	return value
 end
 
 --[[
@@ -466,6 +652,54 @@ end
 
 function Interaction.modalChannels(self: Interaction, id: string): { Types.Channel }
 	return pick(Interaction.modalSelected(self, id), resolved(self).channels)
+end
+
+----------------------------------------------------------------------------
+-- Reading a select in a message
+----------------------------------------------------------------------------
+
+--[[
+	The objects picked in a user, role, mentionable or channel select on a
+	message, in the order the user picked them.
+
+	A component interaction carries the picks as ids in `data.values` and the
+	objects in `data.resolved`, the same split a modal has -- but at the top
+	level of `data`, not inside a submitted field, so the `modal*` readers do
+	not reach them. A mentionable select's picks are split across
+	`selectedUsers` and `selectedRoles`, each skipping the other kind.
+]]
+function Interaction.selectedUsers(self: Interaction): { Types.User }
+	return pick(Interaction.values(self), resolved(self).users)
+end
+
+--- The picked users who are members of this server, each with `user`
+--- spliced in -- Discord's resolved members omit it, as with `getMember`.
+function Interaction.selectedMembers(self: Interaction): { Types.Member }
+	-- Not `pick`: splicing needs each member's id, which `pick` drops.
+	local data = resolved(self)
+	local members = data.members or {}
+	local users = data.users or {}
+	local out: { Types.Member } = {}
+	for _, id in Interaction.values(self) do
+		local member: Types.Member? = members[id]
+		if member ~= nil then
+			-- Inserted before the splice: refining on `member.user` would
+			-- narrow `member` to a type `out` does not hold.
+			table.insert(out, member)
+			if member.user == nil then
+				member.user = users[id]
+			end
+		end
+	end
+	return out
+end
+
+function Interaction.selectedRoles(self: Interaction): { Types.Role }
+	return pick(Interaction.values(self), resolved(self).roles)
+end
+
+function Interaction.selectedChannels(self: Interaction): { Types.Channel }
+	return pick(Interaction.values(self), resolved(self).channels)
 end
 
 --- What the BOT may do in this channel, as Discord computed it. More

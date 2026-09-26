@@ -11,6 +11,9 @@ much. The log usually says more than Discord does, so start there: run with
 - ["The application did not respond"](#the-application-did-not-respond)
 - ["Interaction has already been acknowledged"](#interaction-has-already-been-acknowledged)
 - [A handler never fires](#a-handler-never-fires)
+- [A warning says an event "will never fire"](#a-warning-says-an-event-will-never-fire)
+- ["Operator '..' could not be applied" in a listener](#operator--could-not-be-applied-in-a-listener)
+- [A `register` or `deploy` list won't typecheck](#a-register-or-deploy-list-wont-typecheck)
 - [`message.content` is empty](#messagecontent-is-empty)
 - [Slash commands don't appear](#slash-commands-dont-appear)
 - [Components vanish from webhook messages](#components-vanish-from-webhook-messages)
@@ -136,14 +139,16 @@ Work through these in order:
 1. **A missing intent.** Intents decide which events Discord sends at all.
    `messageCreate` needs `guildMessages` (and `directMessages` for DMs),
    reactions need `guildMessageReactions`, `guildMemberAdd` needs the
-   privileged `guildMembers`, and so on. Nothing warns you: the event just
-   never arrives. Interactions are the exception, and arrive whatever
-   intents you ask for. [events.md](events.md) has the full list.
+   privileged `guildMembers`, and so on. The client logs a warning when you
+   listen for an event none of whose intents are enabled (see
+   [below](#a-warning-says-an-event-will-never-fire)). Interactions are the
+   exception, and arrive whatever intents you ask for.
+   [events.md](events.md) has the full list.
 2. **The event name.** Listeners use camelCase names: `messageCreate`,
    `guildMemberAdd`. `client:on("MESSAGE_CREATE", ...)` and
-   `client:on("message", ...)` register fine and never fire. To see what
-   is arriving, listen to `raw`, which receives every dispatch as
-   `(eventName, data)`.
+   `client:on("message", ...)` register and never fire, and the log says
+   `no event named "message"` with a suggestion. To see what is arriving,
+   listen to `raw`, which receives every dispatch as `(eventName, data)`.
 3. **The routing prefix.** `client:component(prefix, fn)` matches component
    `custom_id`s that *start with* `prefix`, and `client:modal` does the
    same for modals. A button with id `Vote:yes` doesn't match `vote:`.
@@ -156,7 +161,87 @@ Work through these in order:
    subcommand, and `client:command("role", fn)` handles all of `/role`'s
    subcommands that don't have their own. A command with no handler at all
    replies "`/name` is not wired up on this bot", so if you see that, the
-   name you registered doesn't match the one you deployed.
+   name you registered doesn't match the one you deployed. The warnings
+   after `client:deploy` name both sides of the mismatch
+   ([commands.md](commands.md#handler-and-command-mismatches)).
+6. **A handler on a builder that was never registered.** `:handle` only
+   stores the function. `client:register` is what routes it.
+
+## A warning says an event "will never fire"
+
+```text
+WARN	listening for "guildMemberAdd", but the guildMembers intent is not enabled, so it will never fire; guildMembers is privileged, so it must also be enabled in the developer portal (Bot > Privileged Gateway Intents)
+```
+
+**Cause.** You called `client:on` (or `once`, or `waitFor`) for an event
+that only arrives with intents your client didn't ask for. Discord sends
+nothing outside the intents a bot asks for, so the listener would sit there
+forever. When several intents can deliver the event, the warning lists
+them all and appears only if none is enabled.
+
+**Fix.** Add one of the named intents to `intents` in `Client.new`. If the
+warning says the intent is privileged, also switch it on under **Bot >
+Privileged Gateway Intents**, or the connection is refused with
+[4014](#the-bot-connects-then-stops-close-code-4014). If you don't need the
+event, remove the listener. See [events.md](events.md#listener-warnings).
+
+## "Operator '..' could not be applied" in a listener
+
+```text
+TypeError: Operator '..' could not be applied to operands of types string and unknown; there is no corresponding overload for __concat
+```
+
+or, for `#m.content`, `Operator '#' could not be applied to operand of type
+unknown`.
+
+**Cause.** A limit of Luau 1.0.0's checker. `client:on` infers a listener's
+parameter type from the event name, but an operator applied directly to an
+unannotated parameter can be checked before that type is known. Property
+access, string interpolation and function calls on the same parameter are
+fine; operators such as `..` and `#` aren't.
+
+**Fix.** Annotate the parameter, which is still checked against the event:
+
+```luau
+client:on("messageCreate", function(m: Discord.Message)
+	print("hi " .. m.author.username)
+end)
+```
+
+or use interpolation: `` print(`hi {m.author.username}`) ``. See
+[events.md](events.md#typed-listeners).
+
+## A `register` or `deploy` list won't typecheck
+
+```text
+TypeError: Expected this to be
+	'(Interaction) -> (...any) ...'
+but got
+	'(t1) -> () where t1 = { read reply: (t1, string) -> (...unknown) }'
+```
+
+**Cause.** A builder with an inline handler, written inside a table
+literal:
+
+```luau
+client:register({
+	Commands.slash("ping", "Check I am alive"):handle(function(ix)
+		ix:reply("pong")
+	end),
+})
+```
+
+Luau 1.0.0 doesn't carry the expected type into a function nested inside a
+table literal, so `ix` isn't inferred as an Interaction. The same goes for a
+`subcommand` callback's parameter inside a table literal.
+
+**Fix.** Pass the builders as arguments, where `ix` is inferred:
+`client:register(ping, help)`, or
+`client:register(Commands.slash(...):handle(function(ix) ... end))`. Or
+annotate the parameters (`function(ix: Discord.Interaction)`,
+`function(sub: Discord.Command)`). A list built in a module from
+`require`d builders, like the scaffold's `commands/init.luau`, is fine as it
+is. See [commands.md](commands.md#clientregister).
 
 ## `message.content` is empty
 

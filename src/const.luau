@@ -22,7 +22,7 @@ Const.CDN_BASE = "https://cdn.discordapp.com"
 Const.GATEWAY_QUERY = "?v=10&encoding=json"
 
 -- The library's own version, and where it lives. Both feed the User-Agent.
-Const.VERSION = "0.3.0"
+Const.VERSION = "0.4.0"
 Const.REPOSITORY_URL = "https://github.com/brandnewcrisis/lute-discord"
 
 -- Sent with every REST call. Discord asks for this exact shape and will

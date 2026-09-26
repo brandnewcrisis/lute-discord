@@ -25,6 +25,7 @@
 local blame = require("@discord/blame")
 local Color = require("@discord/color")
 local Const = require("@discord/const")
+local Spec = require("@discord/spec")
 local Types = require("@discord/types")
 
 local Components = {}
@@ -117,6 +118,49 @@ local LABEL_CHILDREN = set(
 -- unknown field at best.
 local DISABLEABLE = set(T.BUTTON, T.STRING_SELECT, T.USER_SELECT, T.ROLE_SELECT, T.MENTIONABLE_SELECT, T.CHANNEL_SELECT)
 
+--[[
+	Key sets for `Spec.check`, one per spec shape, and the aliases that map
+	Discord's wire names onto this library's. The wire names are the likely
+	slip: they are what the API reference and every JSON example show, and
+	passing one here typechecks, runs, and is silently dropped.
+]]
+local ID_ALIAS = { custom_id = "id" }
+local RANGE_ALIASES = { custom_id = "id", min_values = "min", max_values = "max" }
+
+local BUTTON_KEYS = Spec.keys({ "id", "label", "style", "emoji", "url", "sku", "disabled" })
+local BUTTON_ALIASES = { custom_id = "id", sku_id = "sku" }
+
+local SELECT_KEYS =
+	Spec.keys({ "id", "placeholder", "options", "min", "max", "disabled", "channelTypes", "required", "defaults" })
+local SELECT_ALIASES = {
+	custom_id = "id",
+	min_values = "min",
+	max_values = "max",
+	default_values = "defaults",
+	channel_types = "channelTypes",
+}
+local SELECT_OPTION_KEYS = Spec.keys({ "label", "value", "description", "emoji", "default" })
+local CHOICE_OPTION_KEYS = Spec.keys({ "label", "value", "description", "default" })
+
+local TEXT_INPUT_KEYS = Spec.keys({ "id", "label", "style", "placeholder", "value", "min", "max", "required" })
+local TEXT_INPUT_ALIASES = { custom_id = "id", min_length = "min", max_length = "max" }
+
+local MEDIA_KEYS = Spec.keys({ "description", "spoiler" })
+local MEDIA_ALIASES = { alt = "description" }
+local GALLERY_ITEM_KEYS = Spec.keys({ "url", "description", "spoiler" })
+local FILE_KEYS = Spec.keys({ "spoiler" })
+local SEPARATOR_KEYS = Spec.keys({ "divider", "spacing" })
+local SECTION_KEYS = Spec.keys({ "accessory" })
+local CONTAINER_KEYS = Spec.keys({ "accent", "spoiler" })
+local CONTAINER_ALIASES = { accent_color = "accent", color = "accent", colour = "accent" }
+
+local FILE_UPLOAD_KEYS = Spec.keys({ "id", "min", "max", "required", "types" })
+local FILE_UPLOAD_ALIASES = { custom_id = "id", min_values = "min", max_values = "max", file_types = "types" }
+local RADIO_GROUP_KEYS = Spec.keys({ "id", "options", "required" })
+local CHECKBOX_GROUP_KEYS = Spec.keys({ "id", "options", "min", "max", "required" })
+local CHECKBOX_KEYS = Spec.keys({ "id", "default" })
+local MODAL_KEYS = Spec.keys({ "id", "title", "components", "inputs" })
+
 local function name(kind: number): string
 	return NAMES[kind] or `component type {kind}`
 end
@@ -198,6 +242,7 @@ export type ButtonSpec = {
 	other style carries a custom id and always does. Mixing them is a 400.
 ]]
 function Components.button(spec: ButtonSpec): Types.Component
+	Spec.check(spec, BUTTON_KEYS, "button", BUTTON_ALIASES)
 	local default = if spec.sku then "premium" elseif spec.url then "link" else "primary"
 	local style = BUTTON_STYLES[spec.style or default]
 	if style == nil then
@@ -303,6 +348,7 @@ local function option(what: string, spec: SelectOption): Types.SelectOption
 end
 
 local function select(kind: number, spec: SelectSpec): Types.Component
+	Spec.check(spec, SELECT_KEYS, name(kind), SELECT_ALIASES)
 	checkId(spec.id)
 	checkLength("select placeholder", spec.placeholder, 150)
 	checkRange("select min", spec.min, 0, 25)
@@ -318,6 +364,7 @@ local function select(kind: number, spec: SelectSpec): Types.Component
 		local built: { Types.SelectOption } = {}
 		options = built
 		for _, entry in spec.options do
+			Spec.check(entry, SELECT_OPTION_KEYS, "select option")
 			table.insert(built, option("select option", entry))
 		end
 	end
@@ -367,6 +414,9 @@ end
 
 --- A menu of your own options. The chosen values arrive as `data.values`.
 function Components.select(spec: SelectSpec): Types.Component
+	-- Checked here as well as in `select`, so a misspelt `options` is
+	-- reported as the typo rather than as "needs options".
+	Spec.check(spec, SELECT_KEYS, "string select", SELECT_ALIASES)
 	if spec.options == nil then
 		error("a string select needs options; use userSelect/roleSelect/channelSelect for the others", blame())
 	end
@@ -479,6 +529,7 @@ export type MediaOptions = {
 --- A small image, usable only as a section's accessory. Images only: GIF
 --- and WEBP animate, video is not supported.
 function Components.thumbnail(url: string, options: MediaOptions?): Types.Component
+	Spec.check(options, MEDIA_KEYS, "thumbnail", MEDIA_ALIASES)
 	local opts: MediaOptions = options or {}
 	checkLength("thumbnail description", opts.description, 1024)
 	return {
@@ -503,6 +554,7 @@ function Components.gallery(...: GalleryItem): Types.Component
 		if type(item) == "string" then
 			table.insert(items, { media = media(item) })
 		else
+			Spec.check(item, GALLERY_ITEM_KEYS, "gallery item", MEDIA_ALIASES)
 			checkLength("gallery item description", item.description, 1024)
 			table.insert(items, { media = media(item.url), description = item.description, spoiler = item.spoiler })
 		end
@@ -518,6 +570,7 @@ end
 	payload's `files`. A URL here is rejected by Discord.
 ]]
 function Components.file(url: string, options: { spoiler: boolean? }?): Types.Component
+	Spec.check(options, FILE_KEYS, "file")
 	if string.match(url, "^attachment://.+") == nil then
 		error(`a file component takes only attachment://<filename>, got "{url}"`, blame())
 	end
@@ -542,6 +595,7 @@ export type SeparatorSpec = {
 
 --- Vertical space between components, with or without a line.
 function Components.separator(spec: SeparatorSpec?): Types.Component
+	Spec.check(spec, SEPARATOR_KEYS, "separator")
 	local opts: SeparatorSpec = spec or {}
 	local spacing: number? = nil
 	if opts.spacing ~= nil then
@@ -601,6 +655,7 @@ export type SectionSpec = {
 	Discord has no section without one, and plain text is just `text`.
 ]]
 function Components.section(spec: SectionSpec, ...: string | Types.Component): Types.Component
+	Spec.check(spec, SECTION_KEYS, "section")
 	local given: { string | Types.Component } = { ... }
 	if #given == 0 or #given > 3 then
 		error(`a section takes 1 to 3 text displays, got {#given}`, blame())
@@ -638,6 +693,7 @@ export type ContainerSpec = {
 	separators and files -- not another container, and not a bare button.
 ]]
 function Components.container(spec: ContainerSpec, ...: string | Types.Component): Types.Component
+	Spec.check(spec, CONTAINER_KEYS, "container", CONTAINER_ALIASES)
 	local given: { string | Types.Component } = { ... }
 	if #given == 0 then
 		error("a container needs at least one component", blame())
@@ -686,6 +742,7 @@ export type TextInputSpec = {
 }
 
 function Components.textInput(spec: TextInputSpec): Types.Component
+	Spec.check(spec, TEXT_INPUT_KEYS, "text input", TEXT_INPUT_ALIASES)
 	checkId(spec.id)
 	checkLength("text input label", spec.label, 45)
 	checkLength("text input placeholder", spec.placeholder, 100)
@@ -721,6 +778,7 @@ export type FileUploadSpec = {
 --- Lets the user attach files to a modal. Read them back with
 --- `Interaction.modalFiles`.
 function Components.fileUpload(spec: FileUploadSpec): Types.Component
+	Spec.check(spec, FILE_UPLOAD_KEYS, "file upload", FILE_UPLOAD_ALIASES)
 	checkId(spec.id)
 	checkRange("file upload min", spec.min, 0, 10)
 	checkRange("file upload max", spec.max, 1, 10)
@@ -755,6 +813,7 @@ local function choices(what: string, given: { ChoiceOption }, low: number): { Ty
 	end
 	local out: { Types.SelectOption } = {}
 	for _, entry in given do
+		Spec.check(entry, CHOICE_OPTION_KEYS, `{what} option`)
 		local built = option(`{what} option`, {
 			label = entry.label,
 			value = entry.value,
@@ -774,6 +833,7 @@ export type RadioGroupSpec = {
 
 --- Exactly one of two to ten options. Read with `Interaction.modalValue`.
 function Components.radioGroup(spec: RadioGroupSpec): Types.Component
+	Spec.check(spec, RADIO_GROUP_KEYS, "radio group", ID_ALIAS)
 	checkId(spec.id)
 	return {
 		type = T.RADIO_GROUP,
@@ -793,6 +853,7 @@ export type CheckboxGroupSpec = {
 
 --- Any number of one to ten options. Read with `Interaction.modalSelected`.
 function Components.checkboxGroup(spec: CheckboxGroupSpec): Types.Component
+	Spec.check(spec, CHECKBOX_GROUP_KEYS, "checkbox group", RANGE_ALIASES)
 	checkId(spec.id)
 	checkRange("checkbox group min", spec.min, 0, 10)
 	checkRange("checkbox group max", spec.max, 1, 10)
@@ -817,6 +878,7 @@ end
 	to make someone tick a box.
 ]]
 function Components.checkbox(spec: { id: string, default: boolean? }): Types.Component
+	Spec.check(spec, CHECKBOX_KEYS, "checkbox", ID_ALIAS)
 	checkId(spec.id)
 	return { type = T.CHECKBOX, custom_id = spec.id, default = spec.default }
 end
@@ -905,6 +967,7 @@ end
 	existing bot uses it.
 ]]
 function Components.modal(spec: ModalSpec): Types.Modal
+	Spec.check(spec, MODAL_KEYS, "modal", ID_ALIAS)
 	checkId(spec.id)
 	if spec.title == "" then
 		error("a modal needs a title", blame())

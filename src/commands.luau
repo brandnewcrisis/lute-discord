@@ -14,9 +14,21 @@
 
 	The shape mirrors Discord's: a command holds options; an option of type
 	SUB_COMMAND holds its own options; a SUB_COMMAND_GROUP holds subcommands.
+
+	A command can also carry its handler, which keeps the schema and the code
+	that answers it in one place -- the usual way a bot breaks is a renamed
+	option or command that the handler, in another file, never heard about:
+
+		local ping = Commands.slash("ping", "Check I am alive"):handle(function(ix)
+			ix:reply("pong")
+		end)
+		client:register({ ping })
+		client:deploy()
 ]]
 local blame = require("@discord/blame")
 local Const = require("@discord/const")
+local Interaction = require("@discord/interaction")
+local Spec = require("@discord/spec")
 local Types = require("@discord/types")
 
 local Commands = {}
@@ -82,6 +94,49 @@ export type OptionSpec = {
 	descriptionLocalizations: { [string]: string }?,
 }
 
+local OPTION_SPEC_KEYS = Spec.keys({
+	"name",
+	"description",
+	"type",
+	"required",
+	"choices",
+	"autocomplete",
+	"min",
+	"max",
+	"minLength",
+	"maxLength",
+	"channelTypes",
+	"nameLocalizations",
+	"descriptionLocalizations",
+})
+
+local OPTION_EXTRA_KEYS = Spec.keys({
+	"required",
+	"choices",
+	"autocomplete",
+	"min",
+	"max",
+	"minLength",
+	"maxLength",
+	"channelTypes",
+	"nameLocalizations",
+	"descriptionLocalizations",
+})
+
+-- Discord's wire names, which are what people type when copying from the
+-- API docs, mapped to this builder's.
+local OPTION_ALIASES = {
+	min_value = "min",
+	max_value = "max",
+	minValue = "min",
+	maxValue = "max",
+	min_length = "minLength",
+	max_length = "maxLength",
+	channel_types = "channelTypes",
+	name_localizations = "nameLocalizations",
+	description_localizations = "descriptionLocalizations",
+}
+
 --- Everything a shorthand option helper accepts, i.e. an `OptionSpec` with
 --- the three arguments it already takes positionally removed.
 export type OptionExtra = {
@@ -104,6 +159,7 @@ local NUMERIC = { integer = true, number = true }
 local CHOOSABLE = { string = true, integer = true, number = true }
 
 local function buildOption(spec: OptionSpec): Types.ApplicationCommandOption
+	Spec.check(spec, OPTION_SPEC_KEYS, `option "{spec.name}"`, OPTION_ALIASES)
 	checkName(spec.name, "option")
 	checkDescription(spec.description, "option")
 	local kind = OPTION_TYPES[spec.type]
@@ -157,7 +213,34 @@ Command.__index = Command
 	subcommands, whose payload is an OPTION rather than a command -- see
 	`subcommand` for where the two meet.
 ]]
-export type Command = typeof(setmetatable({} :: { data: Types.ApplicationCommand }, {} :: typeof(Command)))
+--- What `handle` and `onAutocomplete` accept. The return is ignored; it is
+--- `...any` so a handler can end with `return ix:reply(...)`.
+export type Handler = (Interaction.Interaction) -> ...any
+
+export type Command = typeof(setmetatable(
+	{} :: {
+		data: Types.ApplicationCommand,
+		_run: Handler?,
+		_autocomplete: Handler?,
+		--- Subcommand and group builders, kept so their handlers can be
+		--- found; their payloads already live in `data.options`.
+		_children: { any },
+		--- Set on a subcommand group's builder. `data.type` cannot say so:
+		--- a group's option type (2) is also a user context menu's command type.
+		_group: boolean?,
+	},
+	{} :: typeof(Command)
+))
+
+local function new(data: Types.ApplicationCommand): Command
+	return setmetatable({
+		data = data,
+		_run = nil :: Handler?,
+		_autocomplete = nil :: Handler?,
+		_children = {},
+		_group = nil :: boolean?,
+	}, Command)
+end
 
 --[[
 	Appends an option, enforcing the ordering rule.
@@ -210,6 +293,9 @@ end
 ]]
 local function shorthand(self: Command, name: string, description: string, kind: string, extra: OptionExtra?): Command
 	local more: OptionExtra = extra or {}
+	-- Checked here, before the known fields are copied out: a misspelled
+	-- key would otherwise be dropped without a trace.
+	Spec.check(more, OPTION_EXTRA_KEYS, `option "{name}"`, OPTION_ALIASES)
 	-- Level 3: this frame, the public shorthand that called it, then the bot.
 	return option(self, {
 		name = name,
@@ -278,10 +364,11 @@ function Command.subcommand(self: Command, name: string, description: string, bu
 	checkDescription(description, "subcommand")
 	local childData: Types.ApplicationCommand =
 		{ type = Const.OptionType.SUB_COMMAND, name = name, description = description }
-	local child = setmetatable({ data = childData }, Command)
+	local child = new(childData)
 	if build then
 		build(child)
 	end
+	table.insert(self._children, child)
 	-- Discord models a subcommand as an option that holds options, so the
 	-- payload a nested `Command` accumulates IS an option once it is done.
 	-- The two shapes differ only in which fields are mandatory, which is why
@@ -295,8 +382,10 @@ function Command.group(self: Command, name: string, description: string, build: 
 	checkDescription(description, "group")
 	local childData: Types.ApplicationCommand =
 		{ type = Const.OptionType.SUB_COMMAND_GROUP, name = name, description = description }
-	local child = setmetatable({ data = childData }, Command)
+	local child = new(childData)
+	child._group = true
 	build(child)
+	table.insert(self._children, child)
 	for _, option in childData.options or {} do
 		if option.type == Const.OptionType.SUB_COMMAND_GROUP then
 			error(`group "{name}" cannot contain another group`, blame())
@@ -367,6 +456,36 @@ function Command.localize(self: Command, names: { [string]: string }?, descripti
 	return self
 end
 
+--[[
+	Sets the function that answers this command -- or, called on the builder
+	a `subcommand` callback receives, that subcommand. `client:register`
+	collects them all by their full path ("role add").
+
+	A command that has subcommands is answered by them; giving it a handler
+	of its own as well is allowed and acts as the fallback for any
+	subcommand without one.
+]]
+function Command.handle(self: Command, fn: Handler): Command
+	-- Discord never invokes a group itself -- only the subcommands inside
+	-- it -- so a handler here could never run.
+	if self._group then
+		error(`group "{self.data.name}" cannot have a handler; put one on each of its subcommands`, blame())
+	end
+	self._run = fn
+	return self
+end
+
+--- Sets the autocomplete handler for this command or subcommand. It is
+--- called for every option marked `autocomplete = true`; `ix:focused()`
+--- says which one the user is typing in.
+function Command.onAutocomplete(self: Command, fn: Handler): Command
+	if self._group then
+		error(`group "{self.data.name}" cannot have an autocomplete handler; put one on its subcommands`, blame())
+	end
+	self._autocomplete = fn
+	return self
+end
+
 function Command.toJSON(self: Command): Types.ApplicationCommand
 	return self.data
 end
@@ -376,7 +495,7 @@ function Commands.slash(name: string, description: string): Command
 	checkName(name, "command")
 	checkDescription(description, "command")
 	local data: Types.ApplicationCommand = { type = Const.CommandType.CHAT_INPUT, name = name, description = description }
-	return setmetatable({ data = data }, Command)
+	return new(data)
 end
 
 --[[
@@ -391,7 +510,7 @@ function Commands.userCommand(name: string): Command
 		error(`context menu name "{name}" must be 1 to 32 characters`, blame())
 	end
 	local data: Types.ApplicationCommand = { type = Const.CommandType.USER, name = name }
-	return setmetatable({ data = data }, Command)
+	return new(data)
 end
 
 function Commands.messageCommand(name: string): Command
@@ -399,7 +518,37 @@ function Commands.messageCommand(name: string): Command
 		error(`context menu name "{name}" must be 1 to 32 characters`, blame())
 	end
 	local data: Types.ApplicationCommand = { type = Const.CommandType.MESSAGE, name = name }
-	return setmetatable({ data = data }, Command)
+	return new(data)
+end
+
+export type HandlerEntry = {
+	--- "ping", "role add", "config roles add", or a context menu's name.
+	path: string,
+	--- `Const.CommandType` of the top-level command.
+	type: number,
+	run: Handler?,
+	autocomplete: Handler?,
+}
+
+--[[
+	Every handler attached to `command` and its subcommands, with the path
+	each answers to. What `client:register` walks; exposed so a bot with its
+	own router can do the same.
+]]
+function Commands.handlers(command: Command): { HandlerEntry }
+	local out: { HandlerEntry } = {}
+	local kind = command.data.type or Const.CommandType.CHAT_INPUT
+	local function walk(node: Command, path: string)
+		if node._run ~= nil or node._autocomplete ~= nil then
+			table.insert(out, { path = path, type = kind, run = node._run, autocomplete = node._autocomplete })
+		end
+		for _, child in node._children do
+			local childCommand = child :: Command
+			walk(childCommand, `{path} {childCommand.data.name}`)
+		end
+	end
+	walk(command, command.data.name)
+	return out
 end
 
 Commands.Command = Command

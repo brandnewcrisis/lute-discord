@@ -12,12 +12,15 @@
 	    they stay clickable forever and do nothing, which reads as a broken
 	    bot rather than an expired one.
 ]]
+local blame = require("@discord/blame")
 local Client = require("@discord/client")
 local Collector = require("@discord/collector")
 local Components = require("@discord/components")
 local Const = require("@discord/const")
+local Embed = require("@discord/embed")
 local Interaction = require("@discord/interaction")
 local Payload = require("@discord/payload")
+local Spec = require("@discord/spec")
 local Types = require("@discord/types")
 
 local Paginator = {}
@@ -29,8 +32,16 @@ local Paginator = {}
 	the whole message, and anything else is taken as a full message payload
 	with the navigation row merged into it. See `pagePayload` for how an
 	embed is told apart.
+
+	`Embed.Embed` is listed even though `Buildable<Types.Embed>` already
+	admits it structurally. Structural is not enough at a generic call:
+	`table.insert(pages, Embed.new():setTitle("x"))` makes Luau infer
+	`table.insert`'s element type from BOTH arguments, and matching the
+	builder's `toJSON(self: Embed)` against `toJSON: (any) -> Embed` fails
+	there even though assigning the same value to a local first succeeds.
+	Naming the builder type makes the match exact.
 ]]
-export type Page = Types.MessageInput | Types.Buildable<Types.Embed>
+export type Page = Types.MessageInput | Embed.Embed | Types.Buildable<Types.Embed>
 
 export type Options = {
 	--- One payload per page: an embed, a string, or a full message payload.
@@ -42,6 +53,9 @@ export type Options = {
 	counter: boolean?,
 	ephemeral: boolean?,
 }
+
+local OPTION_KEYS = Spec.keys({ "pages", "userId", "timeout", "counter", "ephemeral" })
+local OPTION_ALIASES = { user = "userId", time = "timeout", embeds = "pages" }
 
 -- Keys only an embed has, and keys only a message has. A page is a plain
 -- embed when it has any of the first and none of the second: an embed can
@@ -125,9 +139,10 @@ end
 	continues on the collector's own tasks.
 ]]
 function Paginator.reply(client: Client.Client, ix: Interaction.Interaction, options: Options): Collector.Collector?
+	Spec.check(options, OPTION_KEYS, "paginator", OPTION_ALIASES)
 	local pages = options.pages
-	if #pages == 0 then
-		error("a paginator needs at least one page", 2)
+	if pages == nil or #pages == 0 then
+		error("a paginator needs at least one page", blame())
 	end
 
 	local index = 1
@@ -152,7 +167,7 @@ function Paginator.reply(client: Client.Client, ix: Interaction.Interaction, opt
 		if firstV2 == nil then
 			firstV2 = isV2
 		elseif isV2 ~= firstV2 then
-			error(`paginator page {number} is {if isV2 then "" else "not "}Components V2 but page 1 is {if firstV2 then "" else "not "}; Discord cannot switch a message back`, 2)
+			error(`paginator page {number} is {if isV2 then "" else "not "}Components V2 but page 1 is {if firstV2 then "" else "not "}; Discord cannot switch a message back`, blame())
 		end
 	end
 

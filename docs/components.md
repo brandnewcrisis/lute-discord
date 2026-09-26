@@ -16,6 +16,17 @@ when the check runs inside `ix:reply` or `ix:update`.
 `Components.validate(components, v2)` runs the whole-message check on its
 own, if you build component tables by hand.
 
+Every constructor also checks its spec's keys. Luau accepts an unknown key
+in a table literal without complaint, so a misspelled field would otherwise
+typecheck, run, and be dropped. The likeliest slip is Discord's own field
+name, since that's what the API reference and JSON examples show, so those
+are recognised and pointed at the library's: `button has no option
+"custom_id"; did you mean "id"?`. The same goes for `min_values` and
+`max_values` (`min`, `max`), `min_length` and `max_length` on a text input,
+`default_values` (`defaults`), `channel_types` (`channelTypes`), `sku_id`
+(`sku`), `accent_color` or `color` on a container (`accent`), and `alt` on
+media (`description`). Anything else gets the nearest known key.
+
 ```luau
 --!strict
 local Discord = require("@discord")
@@ -108,17 +119,30 @@ A string select marks its defaults with `default = true` on an option, not
 with `defaults`.
 
 Read the choice with `ix:values()`, which gives you the option values for a
-string select and the IDs for the others. For the auto-filled kinds, the
-objects themselves are in `ix.data.resolved`:
+string select and the IDs for the others. For the auto-filled kinds, Discord
+also sends the objects themselves, and these return them in the order the
+user picked:
+
+| Method | Returns |
+| --- | --- |
+| `ix:selectedUsers()` | `{ Discord.User }`: users picked in a user or mentionable select |
+| `ix:selectedMembers()` | `{ Discord.Member }`: the picked users who are in the server, each with `member.user` filled in |
+| `ix:selectedRoles()` | `{ Discord.Role }`: roles picked in a role or mentionable select |
+| `ix:selectedChannels()` | `{ Discord.Channel }`: channels picked in a channel select (partial channels) |
+
+A mentionable select's picks are split between `selectedUsers` and
+`selectedRoles`. Each returns an empty list when there's nothing of its
+kind.
 
 ```luau
 client:component("pick-user", function(ix: Discord.Interaction)
-	local id = ix:values()[1]
-	local resolved = ix.data.resolved
-	local user = if resolved and resolved.users then resolved.users[id] else nil
+	local user = ix:selectedUsers()[1]
 	ix:update({ content = `You picked {if user then user.username else "nobody"}.`, components = {} })
 end)
 ```
+
+These read a select on a message. In a modal, use `modalUsers` and the other
+[modal readers](#reading-a-submission).
 
 ## Action rows
 
@@ -300,23 +324,35 @@ end)
 | `max` | End after this many collected clicks. |
 | `onCollect` | `(Discord.Interaction) -> ()`, called for each click collected, on its own task. |
 | `onEnd` | `(reason, collected) -> ()`, called exactly once, however it ended. `reason` is `"timeout"`, `"max"`, `"stopped"`, or whatever you passed to `stop`. |
+| `othersMessage` | With both `messageId` and `userId` set, the ephemeral reply to anyone else who clicks. Default `"These buttons aren't for you."`. `false` turns it off. |
+
+The option keys are checked like component specs, so `{ message = id }` or
+`{ time = 60 }` fails with the key you meant (`messageId`, `timeout`).
 
 Things to know:
 
 - **You still have to answer.** What `onCollect` receives is an ordinary
   interaction with the usual three seconds. `update`, `reply` or
-  `deferUpdate` it. If `onCollect` throws, the error is logged and the
-  collector carries on, but the user gets no automatic error message, so an
-  unanswered click shows "The application did not respond".
+  `deferUpdate` it. If `onCollect` throws, the error is logged, the user gets
+  an ephemeral "Something went wrong handling that." (or, if the click was
+  deferred, the placeholder becomes that), and the collector carries on.
 - **Scope it with `messageId`.** A collector gets first refusal on every
-  component click and modal submission the bot receives. One scoped only by
-  `userId` would swallow that user's clicks on every other message too. Get
-  the ID from `ix:fetchReply()` after replying.
-- **Clicks that don't match go elsewhere.** When someone else clicks a
-  button scoped to `userId`, the click falls through to prefix routes. If
-  none matches, it's acknowledged silently, and to that person the button
-  seems to do nothing. If you'd rather tell them, drop `userId` and check
-  `click.user.id` in `onCollect` yourself.
+  component click and modal submission the bot receives, before any prefix
+  route. One scoped only by `userId` or `channelId` swallows every click
+  within that scope, on every other message too. So a collector created
+  with neither `messageId` nor a `filter` logs a warning:
+  `collector has no messageId or filter, so it takes every component click
+  and modal submit ... and swallows the ones meant for other handlers`. Get
+  the ID from `ix:fetchReply()` after replying. A "next click from this
+  user, anywhere" collector is legitimate, and a `filter` on the custom ID
+  both scopes it and silences the warning.
+- **Other people's clicks are answered.** With `messageId` and `userId`
+  both set, a click on that message from anyone else gets an ephemeral
+  `othersMessage` and goes no further. Without that reply the click would
+  fall through to the prefix routes and, with none matching, be acknowledged
+  silently, so the button would seem to do nothing. The `filter` still runs
+  first, so a click the collector wouldn't have taken anyway isn't turned
+  away. Set `othersMessage = false` to let such clicks fall through instead.
 - Collectors live in memory. After a restart their buttons fall through to
   prefix routes, or to the silent acknowledgement.
 - **`max` is counted as clicks arrive.** A click takes its slot before
@@ -377,8 +413,7 @@ client:command("roles", function(ix: Discord.Interaction)
 
 	local pages: { Discord.PaginatorPage } = {}
 	for index, chunk in Discord.Paginator.chunk(lines, 15) do
-		local page = Discord.Embed.new():setTitle(`Roles, page {index}`):setDescription(chunk)
-		table.insert(pages, page)
+		table.insert(pages, Discord.Embed.new():setTitle(`Roles, page {index}`):setDescription(chunk))
 	end
 	Discord.Paginator.reply(client, ix, { pages = pages, timeout = 120 })
 end)
@@ -392,6 +427,8 @@ end)
 | `counter` | Show "3 / 10" between the buttons. Default true. |
 | `ephemeral` | Send it privately. |
 
+The option keys are checked, as for a collector.
+
 `Paginator.chunk(lines, perPage)` joins a list of lines into page-sized
 strings.
 
@@ -402,7 +439,8 @@ it works after a `defer`, and after the interaction was already answered:
 then the pages go out as a follow-up, and the paginator watches and, on
 expiry, edits that follow-up rather than the original response. It returns
 the collector, or nil when there's only one page and so nothing to
-navigate. Clicks from anyone but `userId` are ignored.
+navigate. Anyone but `userId` who clicks is told, ephemerally, that the
+buttons aren't for them (the collector's default `othersMessage`).
 
 A table page is sent as an embed when it has a `toJSON` method (an
 `Embed` builder), or has embed fields (`title`, `description`, `fields`,

@@ -10,9 +10,10 @@
 	  2. Own the shards, and serialise their IDENTIFYs -- Discord allows one
 	     per five seconds per bucket and answers a burst by closing sockets.
 	  3. Keep the cache in step with the gateway.
-	  4. Route: gateway events to listeners, slash commands to their handler
-	     by full subcommand path, component clicks to collectors first and
-	     custom-id prefixes second, modal submits by prefix.
+	  4. Route: gateway events to listeners, application commands to their
+	     handler by command type and full subcommand path, component clicks
+	     to collectors first and custom-id prefixes second, modal submits by
+	     prefix.
 	  5. Contain failures. Every handler runs under `xpcall`; a throw logs a
 	     traceback, tells the user something went wrong if an interaction is
 	     still unanswered, and leaves the shard running.
@@ -22,16 +23,20 @@
 ]]
 local task = require("@lute/task")
 
+local blame = require("@discord/blame")
 local Api = require("@discord/api")
 local Cache = require("@discord/cache")
 local Collector = require("@discord/collector")
+local Commands = require("@discord/commands")
 local Const = require("@discord/const")
 local ApiError = require("@discord/error")
+local Events = require("@discord/events")
 local Gateway = require("@discord/gateway")
 local Http = require("@discord/http")
 local Interaction = require("@discord/interaction")
 local Log = require("@discord/log")
 local Payload = require("@discord/payload")
+local Spec = require("@discord/spec")
 local Types = require("@discord/types")
 local Util = require("@discord/util")
 
@@ -56,6 +61,14 @@ export type Options = {
 	presence: Types.Presence?,
 	--- Reply text when a handler throws. Set to false for silence.
 	errorMessage: (string | boolean)?,
+	--[[
+		Development only: append the error's first line to that reply, so
+		the person testing sees what broke without opening the log. Never
+		the traceback, and never for autocomplete. Leave it off in
+		production -- errors quote internal details (paths, ids, query
+		text) that users of a public bot have no business reading.
+	]]
+	showErrors: boolean?,
 	--- Passed to `Http.new`: a custom transport, base URL, retry count.
 	http: Http.HttpOptions?,
 	--- Passed to every shard, and the identify pacing. See `GatewayTuning`.
@@ -93,6 +106,22 @@ export type FetchMembersOptions = {
 	timeout: number?,
 }
 
+-- Every key of `Options`, so a misspelled one fails at `Client.new` instead
+-- of being silently ignored. Kept next to the type: add to both.
+local CLIENT_OPTION_KEYS = Spec.keys({
+	"token",
+	"intents",
+	"cache",
+	"logLevel",
+	"logFile",
+	"shardCount",
+	"presence",
+	"errorMessage",
+	"showErrors",
+	"http",
+	"gateway",
+})
+
 --- An outstanding op 8 request, filled in by GUILD_MEMBERS_CHUNK.
 type MemberRequestState = {
 	guildId: string,
@@ -105,15 +134,24 @@ type MemberRequestState = {
 --[[
 	A registered listener.
 
-	`fn` takes `any` because the event bus is keyed by string and every one of
-	the sixty-odd gateway events carries a different payload -- Luau has no
-	way to tie the name to the shape. Handlers annotate their own parameter
-	(`function(message: Types.Message)`) and get checked from there; the
-	`Types` module is what says which shape goes with which name.
+	`fn` is untyped here because the bus is keyed by string. The typing
+	lives at the door: `client:on` is declared as `Events.On`, which ties
+	each event name to its payload, so the listener a bot passes in is
+	checked against the right shape before it gets stored as this.
 ]]
-type Listener = { id: number, event: string, fn: (any, any) -> (), once: boolean }
+type Listener = { id: number, event: string, fn: (...any) -> ...any, once: boolean }
 
-type Route = { prefix: string, fn: (Interaction.Interaction) -> () }
+--[[
+	What `command`, `autocomplete`, `component` and `modal` take. The return
+	is ignored; it is `...any` so a handler can end with
+	`return ix:reply(...)`.
+]]
+export type Handler = (Interaction.Interaction) -> ...any
+
+type Route = { prefix: string, fn: Handler }
+
+--- Handlers by `Const.CommandType`, then by path.
+type TypedHandlers = { [number]: { [string]: Handler } }
 
 export type Client = typeof(setmetatable(
 	{} :: {
@@ -129,8 +167,21 @@ export type Client = typeof(setmetatable(
 		startedAt: Util.Instant,
 		running: boolean,
 		_listeners: { [string]: { Listener } },
-		_commands: { [string]: (Interaction.Interaction) -> () },
-		_autocompletes: { [string]: (Interaction.Interaction) -> () },
+		--- `command(path, fn)` with no type: answers that path for any
+		--- command type, after a handler registered for the exact type.
+		_commands: { [string]: Handler },
+		_autocompletes: { [string]: Handler },
+		--- From `register`, or `command(path, fn, type)`.
+		_typedCommands: TypedHandlers,
+		_typedAutocompletes: TypedHandlers,
+		--- The builders `register` was given, for `deploy()` with no list.
+		_registered: { Commands.Command },
+		--- Paths every `deploy` so far published, by command type: leaf
+		--- paths plus top-level names (a bare-name handler serves its
+		--- subcommands). What the handler/deploy mismatch check reads.
+		_deployed: { [number]: { [string]: boolean } },
+		--- Once-per-client diagnostics already given, by key.
+		_warned: { [string]: boolean },
 		_components: { Route },
 		_modals: { Route },
 		_collectors: { [Collector.Collector]: boolean },
@@ -188,6 +239,7 @@ local function resolveIntents(intents: { string } | number): number
 end
 
 function Client.new(options: Options): Client
+	Spec.check(options, CLIENT_OPTION_KEYS, "Client.new")
 	-- Only what was asked for: the log is process-wide, and resetting it
 	-- here would undo a `Log.setFile` the bot made before constructing us.
 	if options.logLevel ~= nil then
@@ -213,6 +265,11 @@ function Client.new(options: Options): Client
 		_listeners = {},
 		_commands = {},
 		_autocompletes = {},
+		_typedCommands = {},
+		_typedAutocompletes = {},
+		_registered = {},
+		_deployed = {},
+		_warned = {},
 		_components = {},
 		_modals = {},
 		_collectors = {},
@@ -239,6 +296,70 @@ end
 Client.eventName = camel
 
 --[[
+	Warns, once per event name, about a listener that will never fire.
+
+	Both mistakes are silent otherwise: a misspelled name registers a
+	listener nothing raises, and a listener for an event whose intents are
+	off waits for something Discord was told not to send. The second is the
+	single most common "my handler does nothing" report. Warnings rather
+	than errors, because `client:emit` with a name of your own is fine, and
+	because a bot may add the intent later without touching the listener.
+]]
+local function checkListener(self: Client, event: string)
+	local key = "event:" .. event
+	if self._warned[key] then
+		return
+	end
+	self._warned[key] = true
+
+	if not Events.isKnown(event) then
+		local guess = Events.suggest(event)
+		local hint = if guess ~= nil then `; did you mean "{guess}"?` else ""
+		Log.warn(`no event named "{event}"{hint} (ignore this if the bot raises it itself with client:emit)`)
+		return
+	end
+
+	local missing = Events.missingIntents(event, self.intents)
+	if missing ~= nil then
+		local which = if #missing == 1
+			then `the {missing[1]} intent is not enabled`
+			else `none of the intents that deliver it ({table.concat(missing, ", ")}) is enabled`
+		local privileged = {}
+		for _, intent in missing do
+			if (Const.PRIVILEGED_INTENTS :: { [string]: boolean })[intent] then
+				table.insert(privileged, intent)
+			end
+		end
+		local note = if #privileged > 0
+			then `; {table.concat(privileged, ", ")} is privileged, so it must also be enabled in the developer `
+				.. "portal (Bot > Privileged Gateway Intents)"
+			else ""
+		Log.warn(`listening for "{event}", but {which}, so it will never fire{note}`)
+	elseif Events.needsMessageContent(event) and not Events.hasIntent(self.intents, "messageContent") then
+		-- Info, not a warning: plenty of bots only need the metadata, or
+		-- only answer mentions and DMs, and are right not to ask for it.
+		Log.info(
+			`listening for "{event}" without the messageContent intent: \`content\` (and embeds, `
+				.. "attachments, components) will be empty except in DMs and messages that mention the bot"
+		)
+	end
+end
+
+local function listen(self: Client, event: string, fn: (...any) -> ...any, once: boolean): number
+	checkListener(self, event)
+	local list = self._listeners[event]
+	if list == nil then
+		list = {}
+		self._listeners[event] = list
+	end
+	assert(list ~= nil)
+	local id = self._nextListenerId
+	self._nextListenerId += 1
+	table.insert(list, { id = id, event = event, fn = fn, once = once })
+	return id
+end
+
+--[[
 	Registers a listener. Event names are camelCase versions of the gateway's
 	(`messageCreate`, `guildMemberAdd`), plus a few the library raises itself:
 
@@ -257,29 +378,19 @@ Client.eventName = camel
 	  * `error`           -- a handler threw; payload is `(err, context)`
 	  * `raw`             -- every dispatch, as `(eventName, data)`
 
-	Returns a handle for `off`.
+	Typed by `Events.On`: for a known name the listener's parameters are
+	inferred (`function(m)` gets a `Types.Message` for "messageCreate").
+	A name that is not a known event, or one whose intents are not enabled,
+	is logged once as a warning. Returns a handle for `off`.
 ]]
-function Client.on(self: Client, event: string, fn: (any, any) -> ()): number
-	local list = self._listeners[event]
-	if list == nil then
-		list = {}
-		self._listeners[event] = list
-	end
-	assert(list ~= nil)
-	local id = self._nextListenerId
-	self._nextListenerId += 1
-	table.insert(list, { id = id, event = event, fn = fn, once = false })
-	return id
-end
+Client.on = (function(self: Client, event: string, fn: (...any) -> ...any): number
+	return listen(self, event, fn, false)
+end :: any) :: Events.On
 
-function Client.once(self: Client, event: string, fn: (any, any) -> ()): number
-	local id = Client.on(self, event, fn)
-	local list = self._listeners[event]
-	if list ~= nil then
-		list[#list].once = true
-	end
-	return id
-end
+--- `on`, removed after the first call.
+Client.once = (function(self: Client, event: string, fn: (...any) -> ...any): number
+	return listen(self, event, fn, true)
+end :: any) :: Events.On
 
 function Client.off(self: Client, id: number)
 	for _, list in self._listeners do
@@ -302,18 +413,14 @@ end
 	    end, 60)
 
 	A filter that throws counts as "no" (and is logged); it must not leave
-	the caller hanging.
+	the caller hanging. Typed by `Events.WaitFor`: the filter's parameters
+	are inferred, the return is not (see there for why).
 ]]
-function Client.waitFor(
-	self: Client,
-	event: string,
-	filter: ((any, any) -> boolean)?,
-	timeout: number?
-): (any, any)
+local function waitFor(self: Client, event: string, filter: ((...any) -> boolean)?, timeout: number?): (any, any)
 	local done = false
 	local first: any, second: any = nil, nil
 	local id: number = 0
-	id = Client.on(self, event, function(a: any, b: any)
+	id = listen(self, event, function(a: any, b: any)
 		if done then
 			return
 		end
@@ -330,7 +437,7 @@ function Client.waitFor(
 		done = true
 		first, second = a, b
 		Client.off(self, id)
-	end)
+	end, false)
 	-- A poll, like `Collector.await`: Lute has no primitive to wake one
 	-- thread from another, and 20ms is invisible next to a human typing.
 	local started = Util.now()
@@ -343,6 +450,8 @@ function Client.waitFor(
 	end
 	return first, second
 end
+
+Client.waitFor = (waitFor :: any) :: Events.WaitFor
 
 --- Runs each listener on its own task: one slow handler must not delay the
 --- next, and a throw must not escape into the gateway loop.
@@ -377,6 +486,15 @@ end
 -- Command routing
 ----------------------------------------------------------------------------
 
+local function bucket(map: TypedHandlers, kind: number): { [string]: Handler }
+	local byPath = map[kind]
+	if byPath == nil then
+		byPath = {}
+		map[kind] = byPath
+	end
+	return byPath :: { [string]: Handler }
+end
+
 --[[
 	Handles `/name`, or a subcommand path like `"role add"`.
 
@@ -384,16 +502,89 @@ end
 	first and then falls back to the bare command name, so a command with
 	subcommands can either handle each one separately or take them all in a
 	single handler.
+
+	`commandType` (`Const.CommandType`) scopes the handler to one kind of
+	command, so a `/info` slash command and a user context menu called
+	"info" can have different handlers. Without it the handler answers the
+	path for every kind that has no handler of its own. `register` always
+	knows the type, so it always scopes.
 ]]
-function Client.command(self: Client, path: string, fn: (Interaction.Interaction) -> ()): Client
-	self._commands[path] = fn
+function Client.command(self: Client, path: string, fn: Handler, commandType: number?): Client
+	if commandType ~= nil then
+		bucket(self._typedCommands, commandType)[path] = fn
+	else
+		self._commands[path] = fn
+	end
 	return self
 end
 
 --- Handles autocomplete for a command path.
-function Client.autocomplete(self: Client, path: string, fn: (Interaction.Interaction) -> ()): Client
-	self._autocompletes[path] = fn
+function Client.autocomplete(self: Client, path: string, fn: Handler, commandType: number?): Client
+	if commandType ~= nil then
+		bucket(self._typedAutocompletes, commandType)[path] = fn
+	else
+		self._autocompletes[path] = fn
+	end
 	return self
+end
+
+--[[
+	Registers the handlers attached to command builders
+	(`Commands.slash(...):handle(fn)`, `sub:handle(fn)`, `:onAutocomplete(fn)`)
+	by their full path and command type, and remembers the builders so
+	`deploy()` with no list publishes exactly these. Returns every builder
+	registered by this call, as a list.
+
+	Takes the commands as arguments -- `client:register(ping, role, help)` --
+	or one list of them, typically assembled in another module. Prefer the
+	argument form when the builders are written inline: Luau does not carry
+	the expected type into a function nested in a table literal, so
+	`client:register({ Commands.slash(...):handle(function(ix) ... end) })`
+	fails to typecheck unless `ix` is annotated, while the same thing passed
+	as an argument infers `ix` as an Interaction.
+
+	Registering the same builders twice is harmless: handlers are keyed by
+	path, and a builder already remembered is not added again.
+]]
+function Client.register(
+	self: Client,
+	first: Commands.Command | { Commands.Command },
+	...: Commands.Command
+): { Commands.Command }
+	local commands: { Commands.Command }
+	if getmetatable(first :: any) == Commands.Command then
+		commands = { first :: Commands.Command, ... }
+	elseif type(first) == "table" then
+		commands = table.clone(first :: { Commands.Command })
+		for _, extra in { ... } do
+			table.insert(commands, extra)
+		end
+	else
+		error("register takes command builders: client:register(ping, help) or client:register(list)", blame())
+	end
+	for index, command in commands do
+		if type(command) ~= "table" or getmetatable(command :: any) ~= Commands.Command then
+			error(
+				`register: entry {index} is not a command builder; plain command tables carry no handlers `
+					.. "(publish those with client:deploy and route them with client:command)",
+				blame()
+			)
+		end
+	end
+	for _, command in commands do
+		for _, entry in Commands.handlers(command) do
+			if entry.run ~= nil then
+				bucket(self._typedCommands, entry.type)[entry.path] = entry.run
+			end
+			if entry.autocomplete ~= nil then
+				bucket(self._typedAutocompletes, entry.type)[entry.path] = entry.autocomplete
+			end
+		end
+		if table.find(self._registered, command) == nil then
+			table.insert(self._registered, command)
+		end
+	end
+	return commands
 end
 
 --[[
@@ -403,7 +594,7 @@ end
 	the id (`poll:1234:yes`), register one handler for `poll:`, and parse the
 	rest. Longer prefixes win, so a specific id can override a general one.
 ]]
-function Client.component(self: Client, prefix: string, fn: (Interaction.Interaction) -> ()): Client
+function Client.component(self: Client, prefix: string, fn: Handler): Client
 	table.insert(self._components, { prefix = prefix, fn = fn })
 	table.sort(self._components, function(a: Route, b: Route): boolean
 		return #a.prefix > #b.prefix
@@ -412,7 +603,7 @@ function Client.component(self: Client, prefix: string, fn: (Interaction.Interac
 end
 
 --- Handles modal submissions whose `custom_id` starts with `prefix`.
-function Client.modal(self: Client, prefix: string, fn: (Interaction.Interaction) -> ()): Client
+function Client.modal(self: Client, prefix: string, fn: Handler): Client
 	table.insert(self._modals, { prefix = prefix, fn = fn })
 	table.sort(self._modals, function(a: Route, b: Route): boolean
 		return #a.prefix > #b.prefix
@@ -426,6 +617,41 @@ function Client.collect(self: Client, options: Collector.Options): Collector.Col
 end
 
 --[[
+	The handler routing would pick for a command of `kind` at `path`.
+
+	Most specific first: this type's handler for the full path, then an
+	untyped one for the full path, then the same two for the bare command
+	name. The bare-name fallback is for chat input only: a context menu's
+	name is one unit, spaces and all ("Who is this"), not a path.
+
+	Shared by routing and by the post-deploy check, so the check's idea of
+	"has a handler" cannot drift from what actually runs.
+]]
+local function findHandler(typed: TypedHandlers, untyped: { [string]: Handler }, kind: number, path: string): Handler?
+	local byType = typed[kind]
+	local exact = (byType and byType[path]) or untyped[path]
+	if exact ~= nil or kind ~= Const.CommandType.CHAT_INPUT then
+		return exact
+	end
+	local bare = string.match(path, "^(%S+)") or path
+	return (byType and byType[bare]) or untyped[bare]
+end
+
+--- The first line of an error, capped, for `showErrors`.
+local function errorSummary(err: string): string
+	local line = string.match(err, "^[^\n]*") or err
+	-- Cut on a character boundary: a split UTF-8 sequence makes Discord
+	-- reject the whole message.
+	local limit = 1500
+	if (utf8.len(line) or #line) > limit then
+		local cut = utf8.offset(line, limit + 1)
+		line = string.sub(line, 1, (cut or limit + 1) - 1) .. "..."
+	end
+	-- A fence inside the text would end the code block early.
+	return (string.gsub(line, "```", "`\u{200B}``"))
+end
+
+--[[
 	Runs a command handler with a safety net.
 
 	If it throws, the user gets one ephemeral apology (never a raw traceback
@@ -433,7 +659,7 @@ end
 	to the log. If the interaction was never answered at all, answering it
 	here is what stops the client showing "application did not respond".
 ]]
-local function runHandler(self: Client, ix: Interaction.Interaction, fn: (Interaction.Interaction) -> (), label: string)
+local function runHandler(self: Client, ix: Interaction.Interaction, fn: Handler, label: string)
 	task.spawn(function()
 		-- Logged before the handler runs, not after, so a handler that hangs
 		-- still leaves a record of what was invoked.
@@ -462,6 +688,9 @@ local function runHandler(self: Client, ix: Interaction.Interaction, fn: (Intera
 			return
 		end
 		local text = if type(notice) == "string" then notice else "Something went wrong running that."
+		if self.options.showErrors then
+			text ..= `\n\`\`\`\n{errorSummary(tostring(err))}\n\`\`\``
+		end
 		pcall(function()
 			if ix.deferred then
 				-- A follow-up would leave the "thinking..." placeholder up
@@ -479,10 +708,13 @@ end
 
 local function routeInteraction(self: Client, raw: Types.Interaction)
 	local ix = Interaction.new(self, raw)
+	-- Absent only on interactions that are not commands; CHAT_INPUT is the
+	-- one kind that has ever gone without it.
+	local kind = (raw.data and raw.data.type) or Const.CommandType.CHAT_INPUT
 
 	if raw.type == Const.InteractionType.APPLICATION_COMMAND then
 		local path = Interaction.commandPath(ix)
-		local handler = self._commands[path] or self._commands[(string.match(path, "^(%S+)") :: string)]
+		local handler = findHandler(self._typedCommands, self._commands, kind, path)
 		if handler == nil then
 			Log.warn(`no handler registered for command "{path}"`)
 			-- On its own task and under pcall: a failed reply is a REST
@@ -494,7 +726,7 @@ local function routeInteraction(self: Client, raw: Types.Interaction)
 		runHandler(self, ix, handler, `command /{path}`)
 	elseif raw.type == Const.InteractionType.APPLICATION_COMMAND_AUTOCOMPLETE then
 		local path = Interaction.commandPath(ix)
-		local handler = self._autocompletes[path] or self._autocompletes[(string.match(path, "^(%S+)") :: string)]
+		local handler = findHandler(self._typedAutocompletes, self._autocompletes, kind, path)
 		if handler == nil then
 			-- An empty list is the only honest answer, and it stops the
 			-- client from showing a spinner forever.
@@ -937,20 +1169,156 @@ local function startup(fn: () -> any): any
 	return result
 end
 
+--- How a command reads in a log line: `/role add`, or the menu's name.
+local function describeCommand(kind: number, path: string): string
+	if kind == Const.CommandType.USER then
+		return `user command "{path}"`
+	elseif kind == Const.CommandType.MESSAGE then
+		return `message command "{path}"`
+	end
+	return `/{path}`
+end
+
+--- Every path a deployed command answers to: its leaves ("role add"),
+--- and for chat input with subcommands, its bare name too, since routing
+--- falls back to a bare-name handler for any subcommand.
+local function deployedPaths(command: Types.ApplicationCommand): ({ string }, { string })
+	local leaves: { string } = {}
+	local names: { string } = { command.name }
+	local kind = command.type or Const.CommandType.CHAT_INPUT
+	if kind ~= Const.CommandType.CHAT_INPUT then
+		return { command.name }, names
+	end
+	local function walk(options: { Types.ApplicationCommandOption }?, path: string)
+		local nested = false
+		for _, option in options or {} do
+			if option.type == Const.OptionType.SUB_COMMAND or option.type == Const.OptionType.SUB_COMMAND_GROUP then
+				nested = true
+				walk(option.options, `{path} {option.name}`)
+			end
+		end
+		if not nested then
+			table.insert(leaves, path)
+		end
+	end
+	walk(command.options, command.name)
+	return leaves, names
+end
+
+--[[
+	After a deploy, says which published commands nothing answers, and
+	which handlers answer nothing that was published.
+
+	Both are silent otherwise until a user tries the command: the first
+	shows them "not wired up", the second is usually a typo (`/pign`) whose
+	real command shows the first. Handler-side, every deploy so far counts,
+	so a bot that publishes some commands to a guild and the rest globally
+	is not told its guild handlers are orphans by the global deploy.
+]]
+local function checkWiring(self: Client, commands: { Types.ApplicationCommand })
+	for _, command in commands do
+		local kind = command.type or Const.CommandType.CHAT_INPUT
+		local known = self._deployed[kind]
+		if known == nil then
+			known = {}
+			self._deployed[kind] = known
+		end
+		assert(known ~= nil)
+		local leaves, names = deployedPaths(command)
+		for _, name in names do
+			known[name] = true
+		end
+		for _, path in leaves do
+			known[path] = true
+			local key = `unwired:{kind}:{path}`
+			if findHandler(self._typedCommands, self._commands, kind, path) == nil and not self._warned[key] then
+				self._warned[key] = true
+				Log.warn(`{describeCommand(kind, path)} is deployed but has no handler; users will see "not wired up"`)
+			end
+		end
+	end
+
+	local everyPath: Spec.Keys = {}
+	for _, paths in self._deployed do
+		for path in paths do
+			everyPath[path] = true
+		end
+	end
+	local function orphan(what: string, kind: number?, path: string)
+		local matched = if kind ~= nil then (self._deployed[kind] or {})[path] == true else everyPath[path] == true
+		local key = `orphan:{what}:{kind or 0}:{path}`
+		if matched or self._warned[key] then
+			return
+		end
+		self._warned[key] = true
+		local guess = Spec.suggest(path, everyPath)
+		local hint = if guess ~= nil then ` (did you mean {describeCommand(kind or Const.CommandType.CHAT_INPUT, guess)}?)` else ""
+		local label = describeCommand(kind or Const.CommandType.CHAT_INPUT, path)
+		Log.warn(`{what} for {label} is registered but no such command was deployed; typo?{hint}`)
+	end
+	for kind, byPath in self._typedCommands do
+		for path in byPath do
+			orphan("handler", kind, path)
+		end
+	end
+	for path in self._commands do
+		orphan("handler", nil, path)
+	end
+	for kind, byPath in self._typedAutocompletes do
+		for path in byPath do
+			orphan("autocomplete handler", kind, path)
+		end
+	end
+	for path in self._autocompletes do
+		orphan("autocomplete handler", nil, path)
+	end
+end
+
 --[[
 	Publishes a command set, replacing whatever was there.
 
 	With a `guildId` the change is instant, which is what you want while
 	developing; globally it can take up to an hour to appear. Same call
 	either way, so promoting a bot to global is a one-argument change.
+
+	With no `commands`, publishes everything given to `client:register`.
+	Builders passed in `commands` have their handlers registered as well.
+	Afterwards it logs a warning for each published command with no
+	handler, and each handler with no published command.
 ]]
 function Client.deploy(
 	self: Client,
-	commands: { Api.CommandInput },
+	commands: { Api.CommandInput }?,
 	guildId: string?
 ): { Types.ApplicationCommand }
+	local list: { Api.CommandInput } = {}
+	if commands ~= nil then
+		list = commands
+		-- Builders passed straight to deploy carry their handlers too; wire
+		-- them up, or every one would be reported as unhandled and answered
+		-- with "not wired up" -- the handler is right there in the list.
+		local builders: { Commands.Command } = {}
+		for _, command in commands do
+			if getmetatable(command :: any) == Commands.Command then
+				table.insert(builders, (command :: any) :: Commands.Command)
+			end
+		end
+		if #builders > 0 then
+			Client.register(self, builders)
+		end
+	elseif #self._registered == 0 then
+		error(
+			"deploy() with no command list publishes what client:register was given, and nothing was; "
+				.. "call client:register(...) first or pass the commands",
+			blame()
+		)
+	else
+		for _, command in self._registered do
+			table.insert(list, command)
+		end
+	end
 	return startup(function()
-		return Client._deploy(self, commands, guildId)
+		return Client._deploy(self, list, guildId)
 	end)
 end
 
@@ -971,6 +1339,9 @@ function Client._deploy(
 		then self.api.applications.bulkOverwriteGuildCommands(appId, guildId, payload)
 		else self.api.applications.bulkOverwriteGlobalCommands(appId, payload)
 	Log.info(`deployed {#result} command(s){if guildId then " to guild " .. guildId else " globally"}`)
+	-- What was sent, not what came back: the same commands, and the check
+	-- should not depend on Discord echoing every field.
+	checkWiring(self, payload :: any)
 	return result
 end
 

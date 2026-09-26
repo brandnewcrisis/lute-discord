@@ -14,7 +14,7 @@ local client = Discord.Client.new({
 	intents = { "guilds", "guildMessages", "messageContent" },
 })
 
-client:on("messageCreate", function(message: Discord.Message)
+client:on("messageCreate", function(message)
 	if message.author.bot then
 		return -- never answer bots, including yourself
 	end
@@ -35,15 +35,59 @@ client:run()
 | `client:off(handle)` | Removes a listener. |
 | `client:waitFor(event, filter?, timeout?)` | Yields until `event` fires with arguments `filter` accepts, and returns them, or nil after `timeout` seconds. No timeout means wait forever. |
 
-Listeners take `(any, any)`, because every event carries a different payload
-and Luau has no way to tie an event name string to a type. Annotate the
-parameter yourself, as above, and the checker holds you to it from there.
-The [reference table](#gateway-event-reference) says which type goes with
-which event.
-
 Each listener runs on its own task, so a slow one doesn't delay the others
 or the connection. A listener that throws is logged with a traceback and
 reported through the [`error` event](#library-events). The bot keeps running.
+
+### Typed listeners
+
+`on`, `once` and `waitFor` know every event's payload type, and infer the
+listener's parameters from the event name. In the example above, `message`
+is a `Discord.Message` with no annotation, and `message.author.bot` is
+checked. The [reference table](#gateway-event-reference) says which type
+goes with which event.
+
+An annotation is still allowed, and it's checked against the event, so a
+wrong one is an error (`None of the overloads for function that accept 3
+arguments are compatible`):
+
+```luau
+client:on("guildMemberAdd", function(event: Discord.GuildMemberEvent) -- fine
+	print(`{event.user.username} joined {event.guild_id}`)
+end)
+-- client:on("guildMemberAdd", function(message: Discord.Message) end) -- type error
+```
+
+A name that isn't a known event falls back to an untyped listener,
+`(...any) -> ...any`, because `client:emit` with a name of your own is
+legitimate.
+
+**One limitation.** In Luau 1.0.0, an operator applied directly to an
+unannotated listener parameter fails to typecheck, because the checker can
+look at the operator before it has worked out the parameter's type:
+
+```text
+Operator '..' could not be applied to operands of types string and unknown
+```
+
+`"hi " .. m.author.username` fails this way, and so does `#m.content`.
+Property access, string interpolation and function calls are fine:
+`` `hi {m.author.username}` ``, `string.len(m.content)` and
+`client:reply(m, ...)` all typecheck. The fix is either of:
+
+```luau
+-- Annotate the parameter. It's still checked against the event.
+client:on("messageCreate", function(m: Discord.Message)
+	print("hi " .. m.author.username, #m.content)
+end)
+
+-- Or use interpolation instead of `..`.
+client:on("messageCreate", function(m)
+	print(`hi {m.author.username} ({string.len(m.content)} characters)`)
+end)
+```
+
+### `waitFor`
 
 `waitFor` suits a short conversation inside a command handler:
 
@@ -68,6 +112,11 @@ That one needs the `guildMessages` and `messageContent` intents, since it
 reads what the user typed. A filter that throws counts as "no" and is
 logged. It never leaves `waitFor` hanging.
 
+The filter's parameters are inferred from the event name, like a
+listener's. `waitFor`'s return is `any`, though: a known name also matches
+the untyped fallback, and Luau settles that ambiguity as `any`. Annotate the
+local you assign it to, as above (`local message: Discord.Message? = ...`).
+
 ### Event names
 
 An event's name is the camelCase form of Discord's gateway name:
@@ -76,8 +125,41 @@ An event's name is the camelCase form of Discord's gateway name:
 `messageReactionRemoveEmoji`. `Discord.Client.eventName("GUILD_BAN_ADD")`
 does the conversion if you ever need it.
 
-There's no check on the name. A typo like `messageCreated` registers a
-listener that never fires.
+A name that isn't a known event is logged as a warning, with the likely
+intended name. See [Listener warnings](#listener-warnings).
+
+### Listener warnings
+
+A listener that can never fire is the most common "my handler does
+nothing" report, and nothing about it fails. So the client checks each
+event name the first time you listen for it, and logs what it finds:
+
+- **A misspelled name**, with a suggestion:
+  `no event named "messageCreated"; did you mean "messageCreate"? (ignore
+  this if the bot raises it itself with client:emit)`.
+- **An event none of whose intents are enabled**:
+  `listening for "guildMemberAdd", but the guildMembers intent is not
+  enabled, so it will never fire; guildMembers is privileged, so it must
+  also be enabled in the developer portal (Bot > Privileged Gateway
+  Intents)`. When several intents can deliver the event (`messageCreate`
+  comes with `guildMessages` for servers and `directMessages` for DMs), it
+  warns only if none of them is enabled, and lists them all.
+- **Message events without `messageContent`**, at info level rather than as
+  a warning, because many bots are right not to ask for it:
+  ``listening for "messageCreate" without the messageContent intent:
+  `content` (and embeds, attachments, components) will be empty except in
+  DMs and messages that mention the bot``. This covers `messageCreate` and
+  `messageUpdate`. See [Message content](#message-content).
+
+Each is logged once per event name. They're warnings, not errors: a custom
+event raised with `client:emit` is fine, and a bot may add an intent later
+without touching the listener.
+
+Two other startup checks live elsewhere: a [collector](components.md#collectors)
+with neither `messageId` nor `filter` logs a warning, and `client:deploy`
+warns about [commands and handlers that don't match](commands.md#handler-and-command-mismatches).
+To send any of these somewhere other than the log, see
+[`Log.setHook`](utilities.md#log).
 
 ### What happens to each event
 
@@ -134,6 +216,10 @@ end)
 Wrap it in `pcall`. An error hook that throws is logged, but it isn't reported
 to itself, so a failure there would otherwise go unnoticed.
 
+`error` only covers handlers and listeners that threw. To forward warnings
+as well (the listener warnings, deploy mismatches, rate limits), hook the
+log itself with [`Log.setHook`](utilities.md#log).
+
 **`raw`** is for events the library doesn't know about yet, and for
 debugging. **`interactionCreate`** is for logging or analytics. Answer
 interactions from your handlers, not from here.
@@ -170,6 +256,7 @@ sends the event whatever intents you ask for.
 | `applicationCommandPermissionsUpdate` | `Types.GuildApplicationCommandPermissions` | none |
 | `entitlementCreate`, `entitlementUpdate`, `entitlementDelete` | `Types.Entitlement` | none |
 | `subscriptionCreate`, `subscriptionUpdate`, `subscriptionDelete` | `Types.Subscription` | none |
+| `rateLimited` | `Types.RateLimited` (a gateway request, such as a member fetch, was refused for going too fast) | none |
 
 ### Servers, roles, channels and threads
 
@@ -185,9 +272,11 @@ sends the event whatever intents you ask for.
 | `threadCreate`, `threadUpdate` | `Discord.Channel` | `guilds` |
 | `threadDelete` | `Discord.Channel` (only `id`, `guild_id`, `parent_id`, `type`) | `guilds` |
 | `threadListSync` | `Types.ThreadListSync` | `guilds` |
-| `threadMemberUpdate` | `Types.ThreadMember` (plus `guild_id`) | `guilds` |
+| `threadMemberUpdate` | `Types.ThreadMemberUpdate` | `guilds` |
 | `threadMembersUpdate` | `Types.ThreadMembersUpdate` | `guilds`, plus `guildMembers` for other members' changes |
 | `stageInstanceCreate`, `stageInstanceUpdate`, `stageInstanceDelete` | `Types.StageInstance` | `guilds` |
+| `voiceChannelStatusUpdate` | `Types.VoiceChannelStatusUpdate` | `guilds` |
+| `voiceChannelStartTimeUpdate` | `Types.VoiceChannelStartTimeUpdate` | `guilds` |
 
 `guildCreate` fires for every server when the bot connects, when it joins a
 new one, and when a server comes back from an outage. `guildDelete` with
@@ -242,12 +331,14 @@ on a message cache.
 | `guildEmojisUpdate` | `Types.GuildEmojisUpdate` | `guildExpressions` |
 | `guildStickersUpdate` | `Types.GuildStickersUpdate` | `guildExpressions` |
 | `guildSoundboardSoundCreate`, `guildSoundboardSoundUpdate` | `Types.SoundboardSound` | `guildExpressions` |
-| `guildSoundboardSoundDelete`, `guildSoundboardSoundsUpdate` | no named type (`sound_id` or `soundboard_sounds`, plus `guild_id`) | `guildExpressions` |
+| `guildSoundboardSoundDelete` | `Types.GuildSoundboardSoundDelete` | `guildExpressions` |
+| `guildSoundboardSoundsUpdate` | `Types.GuildSoundboardSounds` | `guildExpressions` |
+| `soundboardSounds` | `Types.GuildSoundboardSounds` | none (the answer to a soundboard request) |
 | `inviteCreate` | `Types.InviteCreateEvent` | `guildInvites` |
 | `inviteDelete` | `Types.InviteDeleteEvent` | `guildInvites` |
 | `guildIntegrationsUpdate` | `Types.GuildIdEvent` | `guildIntegrations` |
-| `integrationCreate`, `integrationUpdate` | `Types.Integration` (plus `guild_id`) | `guildIntegrations` |
-| `integrationDelete` | `Types.GuildIdEvent` (plus `id`, `application_id`) | `guildIntegrations` |
+| `integrationCreate`, `integrationUpdate` | `Types.IntegrationEvent` | `guildIntegrations` |
+| `integrationDelete` | `Types.IntegrationDelete` | `guildIntegrations` |
 | `webhooksUpdate` | `Types.WebhooksUpdate` | `guildWebhooks` |
 
 ### Scheduled events and voice
@@ -257,11 +348,41 @@ on a message cache.
 | `guildScheduledEventCreate`, `guildScheduledEventUpdate`, `guildScheduledEventDelete` | `Types.ScheduledEvent` | `guildScheduledEvents` |
 | `guildScheduledEventUserAdd`, `guildScheduledEventUserRemove` | `Types.GuildScheduledEventUserEvent` | `guildScheduledEvents` |
 | `voiceStateUpdate` | `Types.VoiceState` | `guildVoiceStates` |
-| `voiceChannelEffectSend` | no named type | `guildVoiceStates` |
+| `voiceChannelEffectSend` | `Types.VoiceChannelEffectSend` | `guildVoiceStates` |
 | `voiceServerUpdate` | `Types.VoiceServerUpdate` | none (only after the bot [joins a voice channel](#voice-state)) |
 
-For an event with "no named type", annotate the parameter as
-`{ [string]: any }` and read the fields from Discord's documentation.
+An event Discord adds after this library was written still reaches
+`client:on` under its camelCase name, untyped, with a "no event named"
+warning. Annotate its parameter as `{ [string]: any }` and read the fields
+from Discord's documentation.
+
+## `Discord.Events`
+
+The table above exists in code as `Discord.Events`, and it's what the typed
+listeners and the listener warnings are built from:
+
+| Field | What it is |
+| --- | --- |
+| `Events.REGISTRY` | Every known event name mapped to `{ intents, payload, library? }`: the intents that deliver it (any one is enough; empty means always delivered), the payload type's name, and whether the library raises it rather than Discord. |
+| `Events.NAMES` | The same names as a key set. |
+| `Events.isKnown(name)` | Whether `name` is an event the library or Discord raises. |
+| `Events.suggest(name)` | The known event `name` was probably meant to be, or nil. |
+| `Events.missingIntents(event, mask)` | The intents that would deliver `event`, when the intent bitmask `mask` enables none of them. nil when it will arrive, needs no intent, or is unknown. |
+| `Events.hasIntent(mask, name)` | Whether intent `name` is set in `mask`. |
+| `Events.needsMessageContent(event)` | Whether `event` loses its message text without `messageContent`. |
+
+The types behind `on`, `once` and `waitFor` are there too:
+`Events.Handlers` (each event's listener type), `Events.On` and
+`Events.WaitFor`. The client's own intents are `client.intents`, as a mask:
+
+```luau
+local Events = Discord.Events
+
+local missing = Events.missingIntents("guildMemberAdd", client.intents)
+if missing ~= nil then
+	print(`welcome messages need one of: {table.concat(missing, ", ")}`)
+end
+```
 
 ## Intents
 
