@@ -49,4 +49,9 @@ for _ in seen do
 end
 h.check("backoff is actually jittered", distinct > 10)
 
+local hex = Util.randomHex(16)
+h.check("randomHex gives the requested number of hex digits", #hex == 16 and string.match(hex, "^%x+$") ~= nil)
+h.equals("randomHex handles lengths that are not a multiple of four", #Util.randomHex(7), 7)
+h.check("randomHex varies", Util.randomHex(16) ~= Util.randomHex(16))
+
 h.finish()

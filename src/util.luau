@@ -23,10 +23,27 @@ local Util = {}
 do
 	local seedBytes = crypto.secretbox.keygen()
 	local seed = 0
-	for offset = 0, 5 do
-		seed = (seed * 256 + buffer.readu8(seedBytes, offset)) % 2 ^ 48
+	-- 31 bits: `math.randomseed` takes a C int on some builds, and a wider
+	-- seed is truncated in a platform-specific way.
+	for offset = 0, 3 do
+		seed = (seed * 256 + buffer.readu8(seedBytes, offset)) % 2 ^ 31
 	end
 	math.randomseed(seed)
+end
+
+--[[
+	`length` random hex digits, for multipart boundaries and request nonces.
+
+	Drawn sixteen bits at a time. `math.random(0, 0xFFFFFFFF)` works on
+	macOS but fails on Linux with "interval is empty": the bounds are
+	converted to a C int there, and 0xFFFFFFFF overflows to -1.
+]]
+function Util.randomHex(length: number): string
+	local parts = {}
+	for _ = 1, math.ceil(length / 4) do
+		table.insert(parts, string.format("%04x", math.random(0, 0xFFFF)))
+	end
+	return string.sub(table.concat(parts), 1, length)
 end
 
 --- Monotonic seconds since `mark`. `os.time()` is wall-clock and jumps when

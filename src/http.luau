@@ -474,7 +474,7 @@ end
 	corrupt any upload whose bytes happened to contain it.
 ]]
 local function encodeParts(parts: { Part }): (string, string)
-	local boundary = "----lute" .. string.format("%08x%08x", math.random(0, 0xFFFFFFFF), math.random(0, 0xFFFFFFFF))
+	local boundary = "----lute" .. Util.randomHex(16)
 	local out = {}
 	for _, part in parts do
 		local disposition = `Content-Disposition: form-data; name="{quoted(part.name)}"`

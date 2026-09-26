@@ -207,6 +207,9 @@ The first public release.
   - `setDisabled` disabled every child of a row, not just buttons and
     selects.
   - Builder errors blamed the library's own line instead of the caller's.
+- **Linux.** Multipart uploads and `fetchMembers` failed on Linux with
+  "interval is empty": `math.random(0, 0xFFFFFFFF)` overflows a C int there.
+  Random tokens now come from `Util.randomHex`.
 - **Missing validation.** Button, select, text input and modal title
   lengths were not checked.
 

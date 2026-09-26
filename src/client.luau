@@ -840,7 +840,7 @@ function Client.fetchMembers(
 	end
 	-- Hex from the seeded RNG. The nonce is how chunks find their request
 	-- when several are in flight on one shard; Discord caps it at 32 bytes.
-	local nonce = string.format("%08x%08x", math.random(0, 0xFFFFFFFF), math.random(0, 0xFFFFFFFF))
+	local nonce = Util.randomHex(16)
 	local state: MemberRequestState = { guildId = guildId, members = {}, notFound = {}, received = 0, done = false }
 	self._memberRequests[nonce] = state
 
