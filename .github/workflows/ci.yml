@@ -1,0 +1,32 @@
+# Typecheck, lint and test on every push and pull request.
+#
+# Downloads the same Lute that rokit.toml pins, straight from its release,
+# so CI needs no toolchain manager.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install lute 1.0.0
+        run: |
+          curl -sSfL -o lute.zip https://github.com/luau-lang/lute/releases/download/v1.0.0/lute-linux-x86_64.zip
+          unzip -q lute.zip -d "$HOME/lute"
+          chmod +x "$HOME/lute/lute"
+          echo "$HOME/lute" >> "$GITHUB_PATH"
+          rm lute.zip
+
+      - name: Typecheck
+        run: lute run tools/check.luau
+
+      - name: Lint
+        run: lute lint src examples tests tools
+
+      - name: Test
+        run: lute run tests/run.luau

@@ -1,0 +1,10 @@
+.env
+*.log
+.DS_Store
+
+# Runtime data written by the example bot and by Storage.
+examples/kitchensink/data/*
+!examples/kitchensink/data/.gitkeep
+
+# Scratch directory the storage tests create and remove.
+tests/.tmp-storage/
